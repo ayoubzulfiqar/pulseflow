@@ -1,0 +1,110 @@
+version: "3.8"
+
+services:
+
+  pulseflow:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: pulseflow:latest
+    container_name: pulseflow
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      PULSEFLOW_APP_ENV: production
+      PULSEFLOW_SERVER_PORT: 8080
+      PULSEFLOW_SERVER_HOST: 0.0.0.0
+      PULSEFLOW_REDIS_ADDR: redis:6379
+      PULSEFLOW_REDIS_REQUIRED: "true"
+      PULSEFLOW_POSTGRES_DSN: "postgres://postgres:postgres@postgres:5432/pulseflow?sslmode=disable"
+      PULSEFLOW_POSTGRES_REQUIRED: "true"
+      PULSEFLOW_LOGGING_LEVEL: info
+      PULSEFLOW_LOGGING_FORMAT: json
+      PULSEFLOW_TRACING_ENABLED: "true"
+      PULSEFLOW_TRACING_SERVICE_NAME: pulseflow
+      PULSEFLOW_TRACING_ENDPOINT: "http://otel-collector:4317"
+      PULSEFLOW_TRACING_SAMPLE_RATE: 0.1
+      PULSEFLOW_METRICS_ENABLED: "true"
+      PULSEFLOW_METRICS_PATH: /metrics
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      tempo:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/health/live"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  redis:
+    image: redis:7-alpine
+    container_name: pulseflow-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: pulseflow-postgres
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: pulseflow
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # Optional: tempo + otel-collector for tracing
+  # Uncomment if you want distributed tracing support.
+  #
+  tempo:
+    image: grafana/tempo:latest
+    container_name: pulseflow-tempo
+    command: [
+      "-config.file=/etc/tempo.yaml"
+    ]
+    volumes:
+      - ./deploy/tempo.yaml:/etc/tempo.yaml
+    ports:
+      - "3200:3200"
+   #    - "4317:4317"  # OTLP gRPC
+   #    - "4318:4318"  # OTLP HTTP
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3200/ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  otel-collector:
+    image: otel/opentelemetry-collector:latest
+    container_name: pulseflow-otel
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./deploy/otel-collector-config.yaml:/etc/otel-collector-config.yaml
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+      - "8888:8888"
+    depends_on:
+      - tempo
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8888"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
