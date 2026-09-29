@@ -10,9 +10,172 @@ PulseFlow is an event-driven pipeline that ingests domain events via HTTP, persi
 - Dual write path (durability + streaming) — events are persisted to PostgreSQL *and* published to Redis Streams before acknowledgement
 - Consumer group with XCLAIM failover — dead workers' messages are automatically reclaimed
 - Dead-letter queue with retry isolation — failed messages are quarantined after configurable retries (default: 5)
+- Time-travel replay engine — reprocess historical events from PostgreSQL within any time window
 - HMAC-SHA256 webhook signing with timestamp anti-replay — signed payloads with configurable tolerance window
 - Circuit breaker on the streaming layer — prevents cascade failures when Redis is unavailable
-- Structured observability — Prometheus metrics, JSON structured logs
+- Multi-tenant isolation — per-tenant API keys, rate limits, and audit trails
+- PostgreSQL RANGE partitioning — monthly partitions for high-throughput long-term retention
+- Structured observability — Prometheus metrics, JSON structured logs, real-time WebSocket metrics stream
+- Enterprise control-plane API — full DLQ management, time-travel replay, and circuit breaker reset
+
+## Control Plane API
+
+The control plane provides operator-level APIs for managing and observing the event pipeline. All endpoints require API key authentication when `admin.auth_required: true` is set in configuration.
+
+### DLQ Management
+
+#### GET /v1/admin/dlq
+
+List all dead-lettered messages with server-side filtering and pagination.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `limit` | int | `100` | Max results (capped at 1000) |
+| `offset` | int | `0` | Skip first N results |
+| `types` | string | — | Comma-separated event types |
+| `sources` | string | — | Comma-separated event sources |
+| `status` | string | — | Filter by DLQ status: `pending`, `processing`, `locked`, `resolved` |
+| `min_retry` | int | — | Minimum retry count threshold |
+
+**Response (200):**
+```json
+{
+  "data": [{
+    "id": "1727123456789-0",
+    "event": { "id": "01HZ...", "type": "user.created", "source": "api", "data": {} },
+    "reason": "retry 3: connection timeout",
+    "retry_count": 3,
+    "failed_at": "2024-09-28T12:00:00Z",
+    "consumer": "worker-3",
+    "status": "pending"
+  }],
+  "count": 1,
+  "offset": 0,
+  "limit": 100
+}
+```
+
+The DLQ is mirrored to PostgreSQL (`dlq_messages` table) for durable audit and querying independent of Redis stream retention.
+
+#### POST /v1/admin/dlq/retry
+
+Re-enqueue selected DLQ messages back to the main stream (`pulseflow:events`) with reset retry counters.
+
+**Request body:**
+```json
+{ "ids": ["1727123456789-0", "1727123456790-0"] }
+```
+
+**Response (200):**
+```json
+{ "requested": 2, "requeued": 2, "skipped": 0, "failed": [] }
+```
+
+#### DELETE /v1/admin/dlq/purge?archive=true
+
+Purge all messages from the DLQ stream. When `archive=true` (default), records are persisted to PostgreSQL before deletion for historical audit.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `archive` | bool | `true` | Archive to PostgreSQL before purging |
+
+**Response (200):**
+```json
+{ "deleted": 42 }
+```
+
+### Time-Travel Replay
+
+#### POST /v1/admin/replay
+
+Query historical events from PostgreSQL within a time window and re-publish them to the Redis stream for reprocessing. Events are not re-inserted into PostgreSQL — only republished to the stream.
+
+**Request body:**
+```json
+{
+  "from": "2024-09-01T00:00:00Z",
+  "to": "2024-09-28T23:59:59Z",
+  "types": ["user.created", "order.placed"],
+  "sources": ["billing-service"],
+  "subjects": ["user:123"],
+  "max_events": 5000
+}
+```
+
+**Response (200):**
+```json
+{ "replayed": 5000, "successful": 5000, "failed": 0, "errors": [] }
+```
+
+Each replayed event is enriched with `replayed_at` and `replay_origin: time_travel` metadata for downstream processors.
+
+### Circuit Breaker Control
+
+#### GET /v1/admin/circuit-breaker
+
+Returns the current state of the Redis-stream circuit breaker.
+
+```json
+{ "name": "redis-stream", "state": "closed", "failing": 0, "total_calls": 1234 }
+```
+
+#### POST /v1/admin/circuit-breaker/reset
+
+Manually reset the circuit breaker. Note: sony/gobreaker does not expose a manual reset API; the breaker transitions to half-open automatically after the configured `reset_timeout`. This endpoint logs the reset request.
+
+### WebSocket Metrics Stream
+
+#### GET /v1/ws/metrics
+
+A WebSocket endpoint that streams real-time pipeline metrics to connected dashboard clients. Messages are JSON-encoded `MetricsEvent` objects:
+
+```json
+{
+  "ingress_rps": 42.5,
+  "processed_rps": 41.2,
+  "dlq_count": 3,
+  "active_consumers": 4,
+  "failure_rate": 0.02,
+  "circuit_breaker_state": "closed",
+  "timestamp": "2024-09-28T12:00:00Z"
+}
+```
+
+A heartbeat message is sent immediately upon connection. The server samples metrics every 2 seconds and broadcasts to all connected clients. Slow clients are disconnected after 60 seconds of inactivity.
+
+## Multi-Tenancy
+
+PulseFlow supports first-class multi-tenancy with API key authentication and per-tenant rate limiting.
+
+### Tenant & API Key Management
+
+Tenants and API keys are persisted in PostgreSQL (`tenants` and `api_keys` tables). The `api_keys.key` column stores a SHA-256 hash of the key for secure lookup.
+
+Authentication middleware validates the `X-API-Key` header:
+
+```
+X-API-Key: pk_live_a1b2c3d4e5f6...
+```
+
+When a valid key is found, the tenant ID is attached to the request context via `TenantContextKey`, and per-tenant rate limiting is applied using a Redis-backed token bucket. When auth is not configured, the system falls back to per-IP rate limiting.
+
+| Plan | RPS Limit | Burst |
+|------|-----------|-------|
+| Free | 10 | 10 |
+| Startup | 100 | 20 |
+| Business | 500 | 100 |
+| Enterprise | 5000 | 500 |
+
+### Configuration for Multi-Tenancy
+
+Enable API key authentication for admin endpoints:
+
+```yaml
+admin:
+  auth_required: true
+```
+
+With this enabled, all `/v1/admin/*` and `/v1/ws/*` endpoints require a valid `X-API-Key` header.
 
 ## Architecture
 
@@ -165,6 +328,12 @@ type EventRepository interface {
     Store(ctx context.Context, event *Event) error
     GetByID(ctx context.Context, id EventID) (*Event, error)
     Query(ctx context.Context, filter EventFilter) ([]*Event, error)
+    StoreDLQ(ctx context.Context, msg *DLQMessage) error
+    QueryDLQ(ctx context.Context, filter DLQFilter) ([]*DLQMessage, error)
+    GetDLQByID(ctx context.Context, id string) (*DLQMessage, error)
+    UpdateDLQStatus(ctx context.Context, id string, status DLQStatus, retryCount int) error
+    DeleteDLQ(ctx context.Context, ids []string) (int, error)
+    Health(ctx context.Context) bool
 }
 ```
 
@@ -180,6 +349,9 @@ type EventStream interface {
     Ack(ctx context.Context, ids []string) error
     ClaimStaleMessages(ctx context.Context, consumerName string, minIdle string, batchSize int) ([]StreamMessage, error)
     DeadLetterQueue(ctx context.Context, messages []StreamMessage, reason string) error
+    ListDLQ(ctx context.Context, limit, offset int) ([]StreamMessage, error)
+    RequeueDLQ(ctx context.Context, ids []string) error
+    PurgeDLQ(ctx context.Context) (int, error)
 }
 ```
 
@@ -194,6 +366,22 @@ Runs consumer workers that read from Redis Streams via consumer groups. Implemen
 ### QueryUseCase
 
 Provides paginated, filtered read access to the event store. Supports time-range, type, source, subject filtering, and pagination (limit max 1000, offset).
+
+### DLQUseCase
+
+Dead-letter queue management — list quarantined messages with filtering, bulk re-enqueue to main stream with retry-count reset, purge with optional PostgreSQL archiving. Coordinates between Redis DLQ stream and PostgreSQL audit store.
+
+### EventReplayUseCase
+
+Time-travel replay engine. Queries historical events from PostgreSQL within a time window, enriches with replay metadata, and republishes to the Redis stream for reprocessing without duplicating PostgreSQL records.
+
+### TenantRepository (Port)
+
+Multi-tenant persistence interface for API key validation, tenant lookup (by ID and name), and tenant/key lifecycle management. Implemented by PostgreSQL adapter with SHA-256 key hashing.
+
+### WebSocket Metrics Broadcaster
+
+Periodically samples pipeline metrics (ingress RPS, processing RPS, DLQ count, active consumers, failure rate, circuit breaker state) and broadcasts JSON-encoded events to all connected WebSocket clients over GET /v1/ws/metrics.
 
 ### Webhook Delivery
 
@@ -221,6 +409,7 @@ Configuration is loaded from `config.yaml` (in CWD or `/etc/pulseflow/config.yam
 | **Redis** | `redis.addr` | `localhost:6379` | Redis address |
 | | `redis.pool_size` | `25` | Connection pool size |
 | | `redis.required` | `false` | Fail startup if Redis unreachable |
+| **Admin** | `admin.auth_required` | `false` | Require API key auth for admin endpoints |
 | **Postgres** | `postgres.dsn` | *(required)* | PostgreSQL connection string |
 | | `postgres.max_open_conns` | `25` | Max open connections |
 | | `postgres.required` | `false` | Fail startup if Postgres unreachable |
@@ -333,6 +522,37 @@ Prometheus metrics endpoint.
 | `pulseflow_events_dlq_locked_total` | Counter | — |
 | `pulseflow_stream_claims_total` | Counter | — |
 | `pulseflow_processing_duration_seconds` | Histogram | `phase` |
+
+## Web Dashboard
+
+The PulseFlow dashboard is a Flutter-based admin interface (Web / Desktop / Mobile) providing a visual control plane for operators.
+
+### Screens
+
+| Screen | Description |
+|--------|-------------|
+| **Live Stream Monitor** | Real-time graphs of ingestion RPS, processing RPS, DLQ count, failure rate, active consumers, and circuit breaker state via WebSocket. |
+| **DLQ Operator** | List dead-lettered messages with filters, bulk retry, purge, and per-message detail view. |
+| **Payload Inspector** | Search historical events by type/source/subject, inspect JSON payloads and headers, and trigger time-travel replay of individual events. |
+| **Circuit Breaker Panel** | View live breaker state and 1-click manual reset with reset history log. |
+
+### Build & Run
+
+```bash
+cd dashboard_app
+flutter pub get
+flutter run -d chrome  # Web
+flutter run -d macos   # Desktop
+# Mobile: flutter run
+```
+
+Configure the dashboard to connect to the API:
+
+```bash
+flutter run -d chrome \
+  --dart-define=PULSEFLOW_API_URL=http://localhost:8080 \
+  --dart-define=PULSEFLOW_API_KEY=pk_live_xxx
+```
 
 ## Security
 
@@ -457,14 +677,49 @@ pulseflow/
 ├── deploy/
 │   ├── Dockerfile              # Multi-stage build
 │   └── docker-compose.yml      # Full stack with tracing
+├── dashboard_app/               # Flutter control-plane dashboard (Web/Desktop/Mobile)
+│   ├── pubspec.yaml
+│   ├── lib/
+│   │   ├── main.dart
+│   │   ├── models/models.dart   # Data models (Event, DLQMessage, MetricsEvent, etc.)
+│   │   ├── services/
+│   │   │   ├── api_client.dart  # REST API client
+│   │   │   └── ws_client.dart   # WebSocket metrics client
+│   │   └── screens/
+│   │       ├── live_stream_monitor.dart  # Real-time graphs + metrics
+│   │       ├── dlq_operator.dart        # DLQ list/retry/purge
+│   │       ├── payload_inspector.dart   # Event search & replay
+│   │       └── circuit_breaker_panel.dart # Breaker state & reset
+│   └── web/index.html
 ├── internal/
 │   ├── adapter/
-│   │   ├── api/                # HTTP layer
+│   │   ├── api/                # HTTP layer (Fiber)
+│   │   │   ├── handler.go      # Route handlers (ingest, query, admin, ws)
+│   │   │   ├── middleware.go   # RequestID, Logger, Recover, RateLimiter
+│   │   │   ├── auth.go         # API key auth + per-tenant rate limiting
+│   │   │   ├── admin.go        # DLQ, replay, circuit breaker endpoints
+│   │   │   └── websocket.go    # WebSocket broadcaster + metrics streaming
 │   │   ├── postgres/           # Persistence (pgx v5, embedded migrations)
+│   │   │   ├── event.go        # EventRepository + partition management
+│   │   │   ├── dlq.go          # DLQRepository methods
+│   │   │   ├── tenant.go       # TenantRepository (multi-tenant)
+│   │   │   └── migrations/
 │   │   └── redis/              # Streaming (XADD, XREADGROUP, XCLAIM, DLQ)
+│   │       ├── stream.go       # Stream adapter + DLQ management
+│   │       ├── circuitbreaker.go  # sony/gobreaker wrapper
+│   │       └── circuitbreaker_state.go  # State adapter for admin queries
 │   ├── config/                 # Viper-based loader
 │   ├── entity/                 # Domain (zero deps)
-│   └── usecase/                # Application layer
+│   │   ├── event.go            # Event entity, validation
+│   │   ├── dlq.go              # DLQMessage entity, DLQFilter
+│   │   ├── tenant.go           # Tenant, APIKey entities
+│   ├── usecase/                # Application layer
+│   │   ├── ingest.go
+│   │   ├── process.go
+│   │   ├── query.go
+│   │   ├── dlq.go              # DLQ management use case
+│   │   ├── replay.go           # Time-travel replay engine
+│   │   └── metrics.go          # Prometheus metric wrappers
 ├── go.mod
 └── README.md
 ```
