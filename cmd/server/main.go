@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/ayoubzulfiqar/pulseflow/internal/adapter/api"
 	"github.com/ayoubzulfiqar/pulseflow/internal/adapter/postgres"
@@ -63,6 +64,7 @@ func run() error {
 	// --- Redis ---
 	var redisClient *rdlib.Client
 	var stream entity.EventStream
+	var cbState *redis.CircuitBreakerStateAdapter
 	if cfg.Redis.Addr != "" {
 		redisClient = rdlib.NewClient(&rdlib.Options{
 			Addr:         cfg.Redis.Addr,
@@ -101,12 +103,16 @@ func run() error {
 					"name", name, "from", from.String(), "to", to.String())
 			},
 		})
+
+		// Wrap with circuit breaker and expose state for admin queries.
+		cbState = redis.NewCircuitBreakerStateAdapter("redis-stream", cb, logger)
 		stream = redis.NewCircuitBreakerStream(baseStream, cb)
 	}
 
 	// --- PostgreSQL ---
 	var pgRepo *postgres.EventRepository
 	var repo entity.EventRepository
+	var tenantRepo *postgres.TenantRepository
 	if cfg.Postgres.DSN != "" {
 		pgRepo, err = postgres.NewEventRepository(ctx, postgres.Config{
 			DSN:             cfg.Postgres.DSN,
@@ -121,12 +127,22 @@ func run() error {
 			logger.Warn("postgres: unavailable, running in degraded mode", "error", err)
 		} else {
 			repo = pgRepo
+			tenantRepo = postgres.NewTenantRepository(pgRepo.Pool(), logger)
 		}
 	}
 
 	// --- Use cases ---
 	ingestUC := usecase.NewIngestUseCase(stream, repo, webhook, logger, metrics)
 	queryUC := usecase.NewQueryUseCase(repo, logger)
+
+	var dlqUC *usecase.DLQUseCase
+	var replayUC *usecase.EventReplayUseCase
+	if stream != nil {
+		dlqUC = usecase.NewDLQUseCase(stream, repo, logger)
+		if repo != nil {
+			replayUC = usecase.NewEventReplayUseCase(stream, repo, logger)
+		}
+	}
 
 	var processUC *usecase.ProcessUseCase
 	if stream != nil && repo != nil {
@@ -157,14 +173,56 @@ func run() error {
 		return pgRepo.Health(context.Background())
 	}
 
-	// --- HTTP server ---
-	server := api.NewServer(cfg, ingestUC, queryUC, logger, metrics,
-		api.WithHealthChecks(redisHealthy, dbHealthy))
+	// --- Circuit breaker reset function ---
+	cbResetFn := func(ctx context.Context) error {
+		if cbState != nil {
+			cbState.Reset()
+			return nil
+		}
+		return fmt.Errorf("circuit breaker not configured")
+	}
 
-	// Rate limiter — registered after core middleware (RequestID, Logger, Recover)
-	var rl *api.RateLimiter
+	// --- WebSocket metrics broadcaster ---
+	var metricsBroadcaster *api.MetricsBroadcaster
+	if redisClient != nil {
+		metricsBroadcaster = api.NewMetricsBroadcaster(stream, metrics, 2*time.Second)
+		metricsBroadcaster.Start(ctx)
+	}
+
+	// --- HTTP server ---
+	serverOpts := []api.ServerOption{
+		api.WithHealthChecks(redisHealthy, dbHealthy),
+	}
+	if dlqUC != nil {
+		serverOpts = append(serverOpts, api.WithDLQUseCase(dlqUC))
+	}
+	if replayUC != nil {
+		serverOpts = append(serverOpts, api.WithReplayUseCase(replayUC))
+	}
+	if metricsBroadcaster != nil {
+		serverOpts = append(serverOpts, api.WithWebSocketBroadcaster(metricsBroadcaster.Broadcaster()))
+	}
+	if stream != nil {
+		serverOpts = append(serverOpts, api.WithStream(stream))
+	}
+	if cbState != nil {
+		serverOpts = append(serverOpts, api.WithCBRestFn(cbResetFn))
+	}
+	if tenantRepo != nil {
+		serverOpts = append(serverOpts, api.WithTenantRepo(tenantRepo))
+	}
+
+	server := api.NewServer(cfg, ingestUC, queryUC, logger, metrics, serverOpts...)
+
+	// --- Auth middleware ---
+	if cfg.Admin.AuthRequired && tenantRepo != nil {
+		server.App().Use(api.APIKeyAuth(tenantRepo, logger))
+	}
+
+	// --- Rate limiter — per-tenant if auth enabled, per-IP otherwise ---
+	var rl *api.PerTenantRateLimiter
 	if cfg.RateLimit.Enabled {
-		rl = api.NewRateLimiter(&cfg.RateLimit)
+		rl = api.NewPerTenantRateLimiter(&cfg.RateLimit, logger)
 		server.App().Use(rl.Handler())
 	}
 
@@ -176,6 +234,19 @@ func run() error {
 			}
 		}()
 	}
+
+	// --- Start partition manager (Phase 2) ---
+	if pgRepo != nil {
+		pm := postgres.NewPartitionManager(pgRepo.Pool(), logger, 1*time.Hour, 3)
+		go func() {
+			if err := pm.Run(ctx); err != nil && ctx.Err() == nil {
+				logger.Error("partition manager stopped unexpectedly", "error", err)
+			}
+		}()
+	}
+
+	// --- WebSocket broadcaster start ---
+	// Started internally by metricsBroadcaster.Start(ctx) above.
 
 	// --- Start HTTP server ---
 	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
@@ -200,6 +271,9 @@ func run() error {
 
 	if rl != nil {
 		rl.Stop()
+	}
+	if metricsBroadcaster != nil {
+		metricsBroadcaster.Stop()
 	}
 	if redisClient != nil {
 		redisClient.Close()
