@@ -54,3 +54,15 @@ func (s *CircuitBreakerStream) ClaimStaleMessages(ctx context.Context, consumerN
 func (s *CircuitBreakerStream) DeadLetterQueue(ctx context.Context, messages []entity.StreamMessage, reason string) error {
 	return s.inner.DeadLetterQueue(ctx, messages, reason)
 }
+
+func (s *CircuitBreakerStream) ListDLQ(ctx context.Context, limit, offset int) ([]entity.StreamMessage, error) {
+	return s.inner.ListDLQ(ctx, limit, offset)
+}
+
+func (s *CircuitBreakerStream) RequeueDLQ(ctx context.Context, ids []string) error {
+	return s.inner.RequeueDLQ(ctx, ids)
+}
+
+func (s *CircuitBreakerStream) PurgeDLQ(ctx context.Context) (int, error) {
+	return s.inner.PurgeDLQ(ctx)
+}
