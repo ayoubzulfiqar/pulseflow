@@ -9,6 +9,7 @@ import (
 	"strconv"
 
 	"github.com/ayoubzulfiqar/pulseflow/internal/entity"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // QueryUseCase handles read-side queries against the event store.
@@ -111,10 +112,28 @@ func toJSONBytes(v interface{}) ([]byte, error) {
 }
 
 // TraceIDFromContext extracts a trace ID from the context for logging
-// correlation. Returns empty string if not set.
+// correlation. Checks the manual context value first, then falls back
+// to the OTel span context if the tracing middleware propagated one.
 func TraceIDFromContext(ctx context.Context) string {
-	if v, ok := ctx.Value("trace_id").(string); ok {
+	if v, ok := ctx.Value("trace_id").(string); ok && v != "" {
 		return v
+	}
+	span := trace.SpanFromContext(ctx)
+	if span.SpanContext().IsValid() {
+		return span.SpanContext().TraceID().String()
+	}
+	return ""
+}
+
+// SpanIDFromContext extracts a span ID from the context, falling back
+// to the OTel span context when available.
+func SpanIDFromContext(ctx context.Context) string {
+	if v, ok := ctx.Value("span_id").(string); ok && v != "" {
+		return v
+	}
+	span := trace.SpanFromContext(ctx)
+	if span.SpanContext().IsValid() {
+		return span.SpanContext().SpanID().String()
 	}
 	return ""
 }
