@@ -21,4 +21,10 @@ var (
 
 	// ErrWebhookSend is returned when a webhook delivery fails.
 	ErrWebhookSend = errors.New("usecase: webhook send failed")
+
+	// ErrDLQRetryFailed is returned when re-enqueuing DLQ messages fails.
+	ErrDLQRetryFailed = errors.New("usecase: dlq retry failed")
+
+	// ErrDLQPurgeFailed is returned when purging the DLQ fails.
+	ErrDLQPurgeFailed = errors.New("usecase: dlq purge failed")
 )
