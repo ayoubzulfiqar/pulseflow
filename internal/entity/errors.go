@@ -29,4 +29,14 @@ var (
 
 	// ErrEventTimestampRequired is returned when an event has no timestamp.
 	ErrEventTimestampRequired = errors.New("entity: event timestamp is required")
+
+	// ErrDLQEmpty is returned when a DLQ operation targets no messages.
+	ErrDLQEmpty = errors.New("entity: dlq operation targets no messages")
+
+	// ErrDLQMessageNotFound is returned when a DLQ message ID does not exist.
+	ErrDLQMessageNotFound = errors.New("entity: dlq message not found")
+
+	// ErrDLQOperationNotAllowed is returned when a DLQ operation is invalid
+	// for the current message status (e.g. retry on a locked message).
+	ErrDLQOperationNotAllowed = errors.New("entity: dlq operation not allowed")
 )
