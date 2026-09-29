@@ -180,9 +180,222 @@ func (r *EventRepository) Close() {
 	r.pool.Close()
 }
 
+// Pool returns the underlying connection pool for use by other repositories
+// (e.g. TenantRepository) that share the same database.
+func (r *EventRepository) Pool() *pgxpool.Pool {
+	return r.pool
+}
+
 // Health checks database connectivity via Ping.
 func (r *EventRepository) Health(ctx context.Context) bool {
 	return r.pool.Ping(ctx) == nil
+}
+
+// --- DLQ persistence methods ---
+
+// StoreDLQ persists a dead-lettered message to the dlq_messages table.
+func (r *EventRepository) StoreDLQ(ctx context.Context, msg *entity.DLQMessage) error {
+	if msg == nil {
+		return fmt.Errorf("postgres: dlq message is nil")
+	}
+
+	var eventID, eventSource, eventType string
+	var data json.RawMessage
+	if msg.Event != nil {
+		eventID = string(msg.Event.ID)
+		eventSource = msg.Event.Source
+		eventType = string(msg.Event.Type)
+		data = msg.Event.Data
+	}
+
+	var metadataBytes []byte
+	if msg.Event != nil && msg.Event.Metadata != nil {
+		metadataBytes = marshalMetadata(msg.Event.Metadata)
+	} else {
+		metadataBytes = marshalMetadata(nil)
+	}
+
+	_, err := r.pool.Exec(ctx,
+		`INSERT INTO dlq_messages (id, event_id, event_source, event_type, reason, retry_count, status, failed_at, consumer, data, metadata)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		 ON CONFLICT (id) DO UPDATE SET
+			reason = EXCLUDED.reason,
+			retry_count = EXCLUDED.retry_count,
+			status = EXCLUDED.status,
+			failed_at = EXCLUDED.failed_at,
+			consumer = EXCLUDED.consumer`,
+		msg.ID, eventID, eventSource, eventType,
+		msg.Reason, msg.RetryCount, msg.Status, msg.FailedAt, msg.Consumer,
+		data, metadataBytes,
+	)
+	if err != nil {
+		return fmt.Errorf("postgres: insert dlq message: %w", err)
+	}
+	return nil
+}
+
+// QueryDLQ retrieves DLQ messages from the durable store with filtering
+// and pagination support.
+func (r *EventRepository) QueryDLQ(ctx context.Context, filter entity.DLQFilter) ([]*entity.DLQMessage, error) {
+	types := convertEventTypes(filter.Types)
+	var fromVal, toVal interface{}
+	if !filter.From.IsZero() {
+		fromVal = filter.From
+	}
+	if !filter.To.IsZero() {
+		toVal = filter.To
+	}
+
+	query := `
+		SELECT id, event_id, event_source, event_type, reason, retry_count,
+		       status, failed_at, consumer, data, metadata
+		FROM dlq_messages
+		WHERE ($1::text[] IS NULL OR event_type = ANY($1))
+		  AND ($2::text[] IS NULL OR event_source = ANY($2))
+		  AND ($3::text[] IS NULL OR FALSE) -- subjects filter via event data
+		  AND ($4::text IS NULL OR status = $4)
+		  AND ($5::timestamptz IS NULL OR failed_at >= $5)
+		  AND ($6::timestamptz IS NULL OR failed_at <= $6)
+		  AND retry_count >= $7
+		ORDER BY failed_at DESC
+		LIMIT $8 OFFSET $9`
+
+	// For subjects, we need to match against the event subject stored in metadata.
+	// Simplified: filter by subject in Go after retrieval if needed.
+	rows, err := r.pool.Query(ctx, query, types, filter.Sources, nil,
+		string(filter.Status), fromVal, toVal, filter.MinRetry, filter.MaxLimit, filter.Offset)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: query dlq: %w", err)
+	}
+	defer rows.Close()
+
+	var msgs []*entity.DLQMessage
+	for rows.Next() {
+		msg, err := scanDLQRow(rows)
+		if err != nil {
+			return nil, fmt.Errorf("postgres: scan dlq row: %w", err)
+		}
+		msgs = append(msgs, msg)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("postgres: dlq rows error: %w", err)
+	}
+
+	// Apply subject filtering in Go (subjects are stored in event metadata).
+	if len(filter.Subjects) > 0 {
+		filtered := make([]*entity.DLQMessage, 0, len(msgs))
+		subjectSet := make(map[string]bool, len(filter.Subjects))
+		for _, s := range filter.Subjects {
+			subjectSet[s] = true
+		}
+		for _, m := range msgs {
+			if m.Event != nil && subjectSet[m.Event.Subject] {
+				filtered = append(filtered, m)
+			}
+		}
+		msgs = filtered
+	}
+
+	return msgs, nil
+}
+
+// GetDLQByID retrieves a single DLQ message by its stream message ID.
+func (r *EventRepository) GetDLQByID(ctx context.Context, id string) (*entity.DLQMessage, error) {
+	row := r.pool.QueryRow(ctx,
+		`SELECT id, event_id, event_source, event_type, reason, retry_count,
+		        status, failed_at, consumer, data, metadata
+		 FROM dlq_messages WHERE id = $1`,
+		id,
+	)
+
+	msg, err := scanDLQRow(row)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("%w: %s", entity.ErrDLQMessageNotFound, id)
+		}
+		return nil, fmt.Errorf("postgres: get dlq by id: %w", err)
+	}
+	return msg, nil
+}
+
+// UpdateDLQStatus updates the status and retry count of a DLQ record.
+func (r *EventRepository) UpdateDLQStatus(ctx context.Context, id string, status entity.DLQStatus, retryCount int) error {
+	_, err := r.pool.Exec(ctx,
+		`UPDATE dlq_messages SET status = $1, retry_count = $2 WHERE id = $3`,
+		status, retryCount, id,
+	)
+	if err != nil {
+		return fmt.Errorf("postgres: update dlq status: %w", err)
+	}
+	return nil
+}
+
+// DeleteDLQ removes DLQ records by IDs and returns the count deleted.
+func (r *EventRepository) DeleteDLQ(ctx context.Context, ids []string) (int, error) {
+	if len(ids) == 0 {
+		return 0, nil
+	}
+
+	// Build a parameterized IN clause.
+	params := make([]string, len(ids))
+	args := make([]interface{}, len(ids))
+	for i, id := range ids {
+		params[i] = fmt.Sprintf("$%d", i+1)
+		args[i] = id
+	}
+
+	query := fmt.Sprintf(`DELETE FROM dlq_messages WHERE id IN (%s)`, strings.Join(params, ","))
+	tag, err := r.pool.Exec(ctx, query, args...)
+	if err != nil {
+		return 0, fmt.Errorf("postgres: delete dlq: %w", err)
+	}
+	return int(tag.RowsAffected()), nil
+}
+
+// scanDLQRow converts a database row into a DLQMessage entity.
+func scanDLQRow(row interface {
+	Scan(dest ...interface{}) error
+}) (*entity.DLQMessage, error) {
+	msg := &entity.DLQMessage{}
+	var eventID, eventSource, eventType string
+	var data json.RawMessage
+	var metadataRaw json.RawMessage
+	var consumer *string
+
+	err := row.Scan(
+		&msg.ID, &eventID, &eventSource, &eventType,
+		&msg.Reason, &msg.RetryCount, &msg.Status,
+		&msg.FailedAt, &consumer, &data, &metadataRaw,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	msg.Consumer = derefString(consumer)
+
+	if eventID != "" || eventSource != "" || eventType != "" || data != nil {
+		msg.Event = &entity.Event{
+			ID:       entity.EventID(eventID),
+			Source:   eventSource,
+			Type:     entity.EventType(eventType),
+			Data:     data,
+			Metadata: unmarshalMetadata(metadataRaw),
+		}
+	}
+
+	if msg.FailedAt.IsZero() {
+		msg.FailedAt = time.Now().UTC()
+	}
+
+	return msg, nil
+}
+
+func derefString(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }
 
 // RunMigrations executes all embedded up-migrations.
