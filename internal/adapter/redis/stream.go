@@ -57,20 +57,34 @@ func NewStream(client rd.Cmdable, cfg Config, logger *slog.Logger) *Stream {
 func (s *Stream) Close() error { return nil }
 
 // Publish writes an event to the stream with approximate trimming.
+// Trace context (trace_id, span_id) is included in the message metadata
+// for distributed tracing propagation through the stream.
 func (s *Stream) Publish(ctx context.Context, event *entity.Event) error {
 	data, err := json.Marshal(event)
 	if err != nil {
 		return fmt.Errorf("redis: marshal event: %w", err)
 	}
 
+	values := map[string]interface{}{
+		"data":     string(data),
+		"event_id": string(event.ID),
+		"source":   event.Source,
+		"type":     string(event.Type),
+	}
+
+	// Inject trace context from the event metadata into the stream message.
+	if event.Metadata != nil {
+		if traceID, ok := event.Metadata["trace_id"]; ok {
+			values["trace_id"] = traceID
+		}
+		if spanID, ok := event.Metadata["span_id"]; ok {
+			values["span_id"] = spanID
+		}
+	}
+
 	err = s.client.XAdd(ctx, &rd.XAddArgs{
 		Stream: s.stream,
-		Values: map[string]interface{}{
-			"data":     string(data),
-			"event_id": string(event.ID),
-			"source":   event.Source,
-			"type":     string(event.Type),
-		},
+		Values: values,
 		MaxLen: int64(s.maxLen),
 		Approx: true,
 	}).Err()
