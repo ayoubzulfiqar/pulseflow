@@ -5,6 +5,7 @@ go 1.24
 require (
 	github.com/cenkalti/backoff/v5 v5.0.3
 	github.com/gofiber/fiber/v2 v2.52.8
+	github.com/gofiber/websocket/v2 v2.2.1
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.7.5
 	github.com/oklog/ulid/v2 v2.0.2
@@ -12,6 +13,11 @@ require (
 	github.com/redis/go-redis/v9 v9.22.0
 	github.com/spf13/viper v1.21.0
 	golang.org/x/time v0.11.0
+)
+
+require (
+	github.com/fasthttp/websocket v1.5.3 // indirect
+	github.com/savsgio/gotils v0.0.0-20230208104028-c358bd845dee // indirect
 )
 
 require (
