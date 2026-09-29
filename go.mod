@@ -4,6 +4,7 @@ go 1.25.0
 
 require (
 	cel.dev/cel-go v0.32.0
+	github.com/alicebob/miniredis/v2 v2.39.0
 	github.com/cenkalti/backoff/v5 v5.0.3
 	github.com/gofiber/fiber/v2 v2.52.8
 	github.com/gofiber/websocket/v2 v2.2.1
@@ -13,6 +14,7 @@ require (
 	github.com/prometheus/client_golang v1.20.0
 	github.com/redis/go-redis/v9 v9.22.0
 	github.com/spf13/viper v1.21.0
+	github.com/stretchr/testify v1.12.1
 	go.opentelemetry.io/otel v1.46.0
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.46.0
 	go.opentelemetry.io/otel/sdk v1.46.0
@@ -29,6 +31,7 @@ require (
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.30.0 // indirect
 	github.com/klauspost/cpuid/v2 v2.4.0 // indirect
 	github.com/savsgio/gotils v0.0.0-20230208104028-c358bd845dee // indirect
+	github.com/yuin/gopher-lua v1.1.1 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace v1.46.0 // indirect
 	go.opentelemetry.io/otel/metric v1.46.0 // indirect
