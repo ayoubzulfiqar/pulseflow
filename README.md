@@ -7,16 +7,21 @@ Production-grade event ingestion, processing, and delivery platform. Built for h
 PulseFlow is an event-driven pipeline that ingests domain events via HTTP, persists them durably, publishes them to a Redis Streams consumer-group topology for asynchronous processing, and delivers signed webhook notifications to downstream systems. Designed for horizontal scaling, zero-downtime deploys, and graceful degradation under partial infrastructure failure.
 
 **Key differentiators:**
-- Dual write path (durability + streaming) — events are persisted to PostgreSQL *and* published to Redis Streams before acknowledgement
-- Consumer group with XCLAIM failover — dead workers' messages are automatically reclaimed
-- Dead-letter queue with retry isolation — failed messages are quarantined after configurable retries (default: 5)
-- Time-travel replay engine — reprocess historical events from PostgreSQL within any time window
-- HMAC-SHA256 webhook signing with timestamp anti-replay — signed payloads with configurable tolerance window
-- Circuit breaker on the streaming layer — prevents cascade failures when Redis is unavailable
-- Multi-tenant isolation — per-tenant API keys, rate limits, and audit trails
-- PostgreSQL RANGE partitioning — monthly partitions for high-throughput long-term retention
-- Structured observability — Prometheus metrics, JSON structured logs, real-time WebSocket metrics stream
-- Enterprise control-plane API — full DLQ management, time-travel replay, and circuit breaker reset
+|- Dual write path (durability + streaming) — events are persisted to PostgreSQL *and* published to Redis Streams before acknowledgement
+|- Consumer group with XCLAIM failover — dead workers' messages are automatically reclaimed
+|- Dead-letter queue with retry isolation — failed messages are quarantined after configurable retries (default: 5)
+|- Time-travel replay engine — reprocess historical events from PostgreSQL within any time window
+|- HMAC-SHA256 webhook signing with timestamp anti-replay — signed payloads with configurable tolerance window
+|- Zero-downtime dual-secret rotation — rotate webhook signing keys without service interruption
+|- Conditional delivery via CEL expressions — filter events per-destination using Common Expression Language
+|- Per-destination concurrency limiting — Redis-backed distributed semaphores prevent downstream overload
+|- HTTP 410 Gone auto-disable — decommissioned endpoints are automatically disabled after a Gone response
+|- Circuit breaker on the streaming layer — prevents cascade failures when Redis is unavailable
+|- Multi-tenant isolation — per-tenant API keys, rate limits, and audit trails
+|- PostgreSQL RANGE partitioning — monthly partitions for high-throughput long-term retention
+|- Distributed tracing via OpenTelemetry — W3C TraceContext propagation through HTTP and Redis Streams
+|- Structured observability — Prometheus metrics, JSON structured logs, real-time WebSocket metrics stream
+|- Enterprise control-plane API — full DLQ management, time-travel replay, and circuit breaker reset
 
 ## Control Plane API
 
@@ -228,8 +233,8 @@ Dependency rule: every layer depends only on interfaces defined in inner layers.
 |---|---|---|
 | **Presentation** | `cmd/server`, `internal/adapter/api` | HTTP routing, middleware, request/response handling |
 | **Application** | `internal/usecase` | Business orchestration, validation, enrichment |
-| **Domain** | `internal/entity` | Event entity, EventRepository/EventStream ports, validation rules |
-| **Infrastructure** | `internal/adapter/{redis,postgres}` | Concrete Redis Streams, PostgreSQL, circuit breaker implementations |
+| **Domain** | `internal/entity` | Event/Destination/DLQ entities, ports (Repository, Stream, Propagator, Tracer), validation rules |
+| **Infrastructure** | `internal/adapter/{redis,postgres,tracing,filter,webhook}` | Redis Streams, PostgreSQL, OTel tracing, CEL filtering, webhook delivery implementations |
 | **Configuration** | `internal/config`, `config.yaml` | Viper-based loader with env override |
 
 ## Data Flow
@@ -385,7 +390,23 @@ Periodically samples pipeline metrics (ingress RPS, processing RPS, DLQ count, a
 
 ### Webhook Delivery
 
-Asynchronous, fire-and-forget webhook delivery with HMAC-SHA256 signing, timestamp anti-replay, and exponential backoff retries (cenkalti/backoff/v5).
+Asynchronous, fire-and-forget webhook delivery with HMAC-SHA256 signing, timestamp anti-replay, exponential backoff retries (cenkalti/backoff/v5), dual-secret rotation support, and OpenTelemetry trace propagation. When a destination returns HTTP 410 Gone, it is immediately disabled in PostgreSQL.
+
+### Destination Entity
+
+Represents a webhook delivery target with dual-secret fields (`PrimarySecret`, `SecondarySecret`), CEL filter expressions, per-URL rate limits (`RateLimitRPS`), concurrency caps (`ConcurrencyLimit`), and lifecycle status (`active`/`disabled`). Rotation is controlled by `RotationExpiresAt` — when set and secondary is present, payloads are dual-signed during the rotation window.
+
+### CEL Filter Engine
+
+Compiles and caches CEL expressions per destination. Evaluates `event.type`, `event.data`, `event.metadata`, and other fields before webhook delivery. Non-matching events are skipped gracefully without consuming retry budget.
+
+### Redis Concurrency Limiter
+
+Distributed semaphore using atomic Lua scripts to enforce per-destination in-flight limits. When saturated, delivery is deferred (not retried) to preserve retry counts. Uses 60s TTL for automatic cleanup of crashed-worker locks.
+
+### Tracing Provider
+
+OpenTelemetry SDK setup package supporting OTLP HTTP and gRPC exporters. Configures W3C TraceContext propagator, batch span processor, and service-name resource attributes. Trace context is injected into Redis Stream messages and extracted by consumer workers for end-to-end span linkage.
 
 ### Circuit Breaker
 
@@ -430,7 +451,15 @@ Configuration is loaded from `config.yaml` (in CWD or `/etc/pulseflow/config.yam
 | **Metrics** | `metrics.enabled` | `true` | Expose Prometheus metrics |
 | | `metrics.path` | `/metrics` | Metrics endpoint |
 | **Tracing** | `tracing.enabled` | `false` | Enable OTLP tracing |
+| | `tracing.service_name` | `pulseflow` | Service name for span attribution |
+| | `tracing.exporter` | `otlphttp` | Exporter type: `otlphttp` or `otlpgrpc` |
+| | `tracing.endpoint` | `localhost:4318` | OTLP collector endpoint |
 | | `tracing.sample_rate` | `1.0` | Trace sampling ratio |
+| **Webhooks** | `webhooks.enabled` | `false` | Enable webhook delivery |
+| | `webhooks.timeout` | `30s` | Default HTTP timeout per delivery |
+| | `webhooks.max_retries` | `3` | Max retry attempts before DLQ |
+| | `webhooks.retry_delay` | `5s` | Base retry backoff interval |
+| | `webhooks.endpoints` | `[]` | List of webhook endpoint configs |
 
 ### Environment Variables
 
@@ -439,9 +468,12 @@ All config keys support env overrides with `PULSEFLOW_` prefix:
 ```bash
 PULSEFLOW_SERVER_PORT=9090
 PULSEFLOW_REDIS_ADDR=redis:6379
-PULSEFLOW_POSTGRES_DSN="postgres://user:pass@db:5432/pulseflow?sslmode=disable"
+PULSEFLOW_POSTGRES_DSN="postgres://user:***@db:5432/pulseflow?sslmode=disable"
 PULSEFLOW_LOGGING_LEVEL=debug
 PULSEFLOW_WEBHOOKS_ENABLED=true
+PULSEFLOW_TRACING_ENABLED=true
+PULSEFLOW_TRACING_EXPORTER=otlphttp
+PULSEFLOW_TRACING_ENDPOINT=localhost:4318
 ```
 
 ## API
@@ -563,6 +595,14 @@ All webhook payloads are signed with HMAC-SHA256:
 ```
 signature = HMAC-SHA256(secret, timestamp + "." + hex(payload))
 ```
+
+When dual-secret rotation is active (secondary secret configured), the signature header contains both keys:
+
+```
+X-PulseFlow-Signature: v1=<hash_primary>,v1=<hash_secondary>
+```
+
+Receivers should verify against **either** signature. This enables zero-downtime key rotation — see [Advanced Webhook Delivery](#advanced-webhook-delivery) for the rotation workflow.
 
 Headers:
 
