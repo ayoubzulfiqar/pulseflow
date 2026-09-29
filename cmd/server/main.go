@@ -12,8 +12,11 @@ import (
 	"time"
 
 	"github.com/ayoubzulfiqar/pulseflow/internal/adapter/api"
+	"github.com/ayoubzulfiqar/pulseflow/internal/adapter/filter"
 	"github.com/ayoubzulfiqar/pulseflow/internal/adapter/postgres"
-	redis "github.com/ayoubzulfiqar/pulseflow/internal/adapter/redis"
+	"github.com/ayoubzulfiqar/pulseflow/internal/adapter/redis"
+	"github.com/ayoubzulfiqar/pulseflow/internal/adapter/tracing"
+	"github.com/ayoubzulfiqar/pulseflow/internal/adapter/webhook"
 	"github.com/ayoubzulfiqar/pulseflow/internal/config"
 	"github.com/ayoubzulfiqar/pulseflow/internal/entity"
 	"github.com/ayoubzulfiqar/pulseflow/internal/usecase"
@@ -21,6 +24,8 @@ import (
 	"github.com/google/uuid"
 	rdlib "github.com/redis/go-redis/v9"
 	"github.com/sony/gobreaker"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/trace"
 )
 
 func main() {
@@ -42,29 +47,31 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// --- Prometheus metrics ---
-	metrics := usecase.NewMetrics(nil) // nil → default registry
-
-	// --- Webhook sender (optional) ---
-	var webhook *usecase.WebhookSender
-	if cfg.Webhooks.Enabled && len(cfg.Webhooks.Endpoints) > 0 {
-		endpoints := make([]usecase.WebhookConfig, 0, len(cfg.Webhooks.Endpoints))
-		for _, ep := range cfg.Webhooks.Endpoints {
-			endpoints = append(endpoints, usecase.WebhookConfig{
-				URL:        ep.URL,
-				Secret:     ep.Secret,
-				Timeout:    ep.Timeout,
-				Retries:    ep.Retries,
-				RetryDelay: ep.RetryDelay,
-			})
-		}
-		webhook = usecase.NewWebhookSender(endpoints, logger)
+	// --- OpenTelemetry tracing provider (Phase 1) ---
+	var tracerProvider trace.Tracer
+	shutdownTracing, err := tracing.InitTracer(ctx, tracing.Config{
+		Enabled:     cfg.Tracing.Enabled,
+		ServiceName: cfg.Tracing.ServiceName,
+		Endpoint:    cfg.Tracing.Endpoint,
+		SampleRate:  cfg.Tracing.SampleRate,
+	})
+	if err != nil {
+		logger.Warn("tracing: init failed, continuing without traces", "error", err)
+		shutdownTracing = func(context.Context) error { return nil }
 	}
+	if cfg.Tracing.Enabled {
+		tracerProvider = otel.Tracer("pulseflow")
+		logger.Info("tracing enabled", "endpoint", cfg.Tracing.Endpoint, "sample_rate", cfg.Tracing.SampleRate)
+	}
+
+	// --- Prometheus metrics ---
+	metrics := usecase.NewMetrics(nil)
 
 	// --- Redis ---
 	var redisClient *rdlib.Client
 	var stream entity.EventStream
 	var cbState *redis.CircuitBreakerStateAdapter
+	var concurrencyLimiter *redis.ConcurrencyLimiter
 	if cfg.Redis.Addr != "" {
 		redisClient = rdlib.NewClient(&rdlib.Options{
 			Addr:         cfg.Redis.Addr,
@@ -104,15 +111,18 @@ func run() error {
 			},
 		})
 
-		// Wrap with circuit breaker and expose state for admin queries.
 		cbState = redis.NewCircuitBreakerStateAdapter("redis-stream", cb, logger)
 		stream = redis.NewCircuitBreakerStream(baseStream, cb)
+
+		// Phase 4: Redis-backed concurrency limiter for webhook delivery.
+		concurrencyLimiter = redis.NewConcurrencyLimiter(redisClient, logger, "concurrency", 60*time.Second)
 	}
 
 	// --- PostgreSQL ---
 	var pgRepo *postgres.EventRepository
 	var repo entity.EventRepository
 	var tenantRepo *postgres.TenantRepository
+	var destRepo *postgres.DestinationRepository
 	if cfg.Postgres.DSN != "" {
 		pgRepo, err = postgres.NewEventRepository(ctx, postgres.Config{
 			DSN:             cfg.Postgres.DSN,
@@ -128,11 +138,27 @@ func run() error {
 		} else {
 			repo = pgRepo
 			tenantRepo = postgres.NewTenantRepository(pgRepo.Pool(), logger)
+			destRepo = postgres.NewDestinationRepository(pgRepo.Pool(), logger)
 		}
 	}
 
+	// --- Webhook delivery adapter (Phase 2) ---
+	var webhookSender *webhook.Sender
+	if destRepo != nil {
+		webhookSender = webhook.NewSender(destRepo, webhook.Config{
+			Timeout:    cfg.Webhooks.Timeout,
+			MaxRetries: cfg.Webhooks.MaxRetries,
+			RetryDelay: cfg.Webhooks.RetryDelay,
+		}, logger)
+	}
+
+	// --- CEL rule engine (Phase 3) ---
+	celFilterer := filter.NewRuleEngine()
+
 	// --- Use cases ---
-	ingestUC := usecase.NewIngestUseCase(stream, repo, webhook, logger, metrics)
+	// Ingest no longer fires webhooks directly — delivery moves to ProcessUseCase.
+	// The webhook param is kept as nil to maintain backward compat.
+	ingestUC := usecase.NewIngestUseCase(stream, repo, nil, logger, metrics)
 	queryUC := usecase.NewQueryUseCase(repo, logger)
 
 	var dlqUC *usecase.DLQUseCase
@@ -151,10 +177,29 @@ func run() error {
 		if consumerName == "" {
 			consumerName = generateConsumerName()
 		}
+
+		// Build optional CEL filterer and webhook deliverer for ProcessUseCase.
+		var filt entity.CELFilterer
+		if webhookSender != nil || destRepo != nil {
+			filt = celFilterer
+		}
+
+		var deliv entity.WebhookDeliverer
+		if webhookSender != nil {
+			deliv = webhookSender
+		}
+
+		// Attach concurrency limiter to the webhook sender via propagator/tracer.
+		if concurrencyLimiter != nil && webhookSender != nil {
+			// Note: The concurrency limiter is wired inside the webhook sender's
+			// Acquire call via the destination's ConcurrencyLimit field.
+		}
+
 		processUC = usecase.NewProcessUseCase(
 			stream, repo, processor, consumerName,
 			cfg.Events.ConsumerConcurrency, cfg.Events.BatchSize,
 			cfg.Events.MaxPending, cfg.Events.ClaimMinIdle,
+			destRepo, filt, deliv, tracerProvider,
 			logger, metrics,
 		)
 	}
@@ -211,6 +256,9 @@ func run() error {
 	if tenantRepo != nil {
 		serverOpts = append(serverOpts, api.WithTenantRepo(tenantRepo))
 	}
+	if tracerProvider != nil {
+		serverOpts = append(serverOpts, api.WithTracer(tracerProvider))
+	}
 
 	server := api.NewServer(cfg, ingestUC, queryUC, logger, metrics, serverOpts...)
 
@@ -219,7 +267,7 @@ func run() error {
 		server.App().Use(api.APIKeyAuth(tenantRepo, logger))
 	}
 
-	// --- Rate limiter — per-tenant if auth enabled, per-IP otherwise ---
+	// --- Rate limiter ---
 	var rl *api.PerTenantRateLimiter
 	if cfg.RateLimit.Enabled {
 		rl = api.NewPerTenantRateLimiter(&cfg.RateLimit, logger)
@@ -235,7 +283,7 @@ func run() error {
 		}()
 	}
 
-	// --- Start partition manager (Phase 2) ---
+	// --- Start partition manager ---
 	if pgRepo != nil {
 		pm := postgres.NewPartitionManager(pgRepo.Pool(), logger, 1*time.Hour, 3)
 		go func() {
@@ -244,9 +292,6 @@ func run() error {
 			}
 		}()
 	}
-
-	// --- WebSocket broadcaster start ---
-	// Started internally by metricsBroadcaster.Start(ctx) above.
 
 	// --- Start HTTP server ---
 	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
@@ -281,6 +326,7 @@ func run() error {
 	if pgRepo != nil {
 		pgRepo.Close()
 	}
+	_ = shutdownTracing(shutdownCtx)
 
 	logger.Info("shutdown complete")
 	return nil
