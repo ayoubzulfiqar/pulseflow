@@ -85,8 +85,11 @@ type WebhookConfig struct {
 }
 
 type WebhooksConfig struct {
-	Enabled   bool           `mapstructure:"enabled"`
-	Endpoints []WebhookConfig `mapstructure:"endpoints"`
+	Enabled    bool           `mapstructure:"enabled"`
+	Timeout    time.Duration  `mapstructure:"timeout"`
+	MaxRetries int            `mapstructure:"max_retries"`
+	RetryDelay time.Duration  `mapstructure:"retry_delay"`
+	Endpoints  []WebhookConfig `mapstructure:"endpoints"`
 }
 
 type RateLimitConfig struct {
@@ -118,10 +121,11 @@ type MetricsConfig struct {
 }
 
 type TracingConfig struct {
-	Enabled    bool    `mapstructure:"enabled"`
-	ServiceName string  `mapstructure:"service_name"`
-	Endpoint   string  `mapstructure:"endpoint"`
-	SampleRate float64 `mapstructure:"sample_rate"`
+	Enabled      bool    `mapstructure:"enabled"`
+	ServiceName  string  `mapstructure:"service_name"`
+	Exporter     string  `mapstructure:"exporter"` // "otlphttp" | "otlpgrpc" | "stdout"
+	Endpoint     string  `mapstructure:"endpoint"`
+	SampleRate   float64 `mapstructure:"sample_rate"`
 }
 
 // AdminConfig controls the admin control plane.
@@ -194,9 +198,16 @@ func LoadConfig(configPath string) (*Config, error) {
 	v.SetDefault("logging.format", "json")
 	v.SetDefault("metrics.enabled", true)
 	v.SetDefault("metrics.path", "/metrics")
+	v.SetDefault("tracing.enabled", false)
 	v.SetDefault("tracing.service_name", "pulseflow")
+	v.SetDefault("tracing.exporter", "otlphttp")
+	v.SetDefault("tracing.endpoint", "localhost:4318")
 	v.SetDefault("tracing.sample_rate", 1.0)
 	v.SetDefault("admin.auth_required", false)
+	v.SetDefault("webhooks.enabled", false)
+	v.SetDefault("webhooks.timeout", 30*time.Second)
+	v.SetDefault("webhooks.max_retries", 3)
+	v.SetDefault("webhooks.retry_delay", 5*time.Second)
 
 	var cfg Config
 	if err := v.Unmarshal(&cfg); err != nil {
