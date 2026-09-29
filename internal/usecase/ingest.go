@@ -72,6 +72,9 @@ func (uc *IngestUseCase) Ingest(ctx context.Context, event *entity.Event) (*enti
 	if traceID := TraceIDFromContext(ctx); traceID != "" {
 		ingestMeta["trace_id"] = traceID
 	}
+	if spanID := SpanIDFromContext(ctx); spanID != "" {
+		ingestMeta["span_id"] = spanID
+	}
 	event.EnrichMetadata(ingestMeta)
 
 	// Persist a copy to the durable store before publishing. This provides
