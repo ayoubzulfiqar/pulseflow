@@ -161,7 +161,9 @@ func (uc *ProcessUseCase) handleMessage(ctx context.Context, msg entity.StreamMe
 	if err != nil {
 		uc.logger.Error("process: unmarshal stream message", "error", err)
 		// Can't parse — send to DLQ.
-		_ = uc.stream.DeadLetterQueue(ctx, []entity.StreamMessage{msg}, fmt.Sprintf("unmarshal: %v", err))
+		reason := fmt.Sprintf("unmarshal: %v", err)
+		_ = uc.stream.DeadLetterQueue(ctx, []entity.StreamMessage{msg}, reason)
+		uc.persistDLQ(ctx, msg, reason, 1, entity.DLQStatusLocked)
 		if uc.metrics != nil {
 			uc.metrics.DLQ.Inc()
 		}
@@ -169,25 +171,30 @@ func (uc *ProcessUseCase) handleMessage(ctx context.Context, msg entity.StreamMe
 	}
 
 	if err := uc.processor.Process(ctx, event); err != nil {
-		retryCount := getRetryCount(msg)
-		if retryCount >= MaxDLQRetries {
-			// Permanently locked — route to DLQ with a terminal reason.
-			_ = uc.stream.DeadLetterQueue(ctx, []entity.StreamMessage{msg}, fmt.Sprintf("max retries exceeded: %v", err))
-			if uc.metrics != nil {
-				uc.metrics.DLQLocked.Inc()
-			}
-			uc.logger.Error("process: event locked in DLQ after max retries",
-				"event_id", event.ID, "retry_count", retryCount, "error", err)
-			return nil
-		}
-		// Temporary failure — re-queue to the stream with increased retry count.
-		_ = uc.stream.DeadLetterQueue(ctx, []entity.StreamMessage{msg}, fmt.Sprintf("retry %d: %v", retryCount+1, err))
-		uc.logger.Warn("process: event requeued to DLQ for retry",
-			"event_id", event.ID, "retry_count", retryCount, "error", err)
+	retryCount := getRetryCount(msg)
+	if retryCount >= MaxDLQRetries {
+		// Permanently locked — route to DLQ with a terminal reason.
+		_ = uc.stream.DeadLetterQueue(ctx, []entity.StreamMessage{msg}, fmt.Sprintf("max retries exceeded: %v", err))
+		// Persist to PostgreSQL for audit.
+		uc.persistDLQ(ctx, msg, fmt.Sprintf("max retries exceeded: %v", err), retryCount+1, entity.DLQStatusLocked)
 		if uc.metrics != nil {
-			uc.metrics.DLQ.Inc()
+			uc.metrics.DLQLocked.Inc()
 		}
+		uc.logger.Error("process: event locked in DLQ after max retries",
+			"event_id", event.ID, "retry_count", retryCount, "error", err)
 		return nil
+	}
+	// Temporary failure — re-queue to the stream with increased retry count.
+	reason := fmt.Sprintf("retry %d: %v", retryCount+1, err)
+	_ = uc.stream.DeadLetterQueue(ctx, []entity.StreamMessage{msg}, reason)
+	// Persist to PostgreSQL for audit.
+	uc.persistDLQ(ctx, msg, reason, retryCount+1, entity.DLQStatusPending)
+	uc.logger.Warn("process: event requeued to DLQ for retry",
+		"event_id", event.ID, "retry_count", retryCount, "error", err)
+	if uc.metrics != nil {
+		uc.metrics.DLQ.Inc()
+	}
+	return nil
 	}
 
 	// Success — ack the message.
@@ -232,4 +239,48 @@ func (uc *ProcessUseCase) claimStale(ctx context.Context) {
 		}
 		_ = uc.handleMessage(ctx, msg)
 	}
+}
+
+// persistDLQ writes a DLQ message to PostgreSQL for audit persistence.
+// Failures are logged but non-fatal — the Redis stream is the source of truth.
+func (uc *ProcessUseCase) persistDLQ(ctx context.Context, msg entity.StreamMessage, reason string, retryCount int, status entity.DLQStatus) {
+	if uc.repo == nil {
+		return
+	}
+
+	dlqMsg, err := uc.parseDLQFromStream(msg, reason, retryCount, status)
+	if err != nil {
+		uc.logger.Debug("process: parse dlq for persist", "error", err)
+		return
+	}
+
+	if err := uc.repo.StoreDLQ(ctx, dlqMsg); err != nil {
+		uc.logger.Warn("process: failed to persist dlq to postgres", "error", err, "dlq_id", msg.ID)
+	}
+}
+
+// parseDLQFromStream converts a stream message into a DLQMessage entity
+// suitable for PostgreSQL persistence.
+func (uc *ProcessUseCase) parseDLQFromStream(msg entity.StreamMessage, reason string, retryCount int, status entity.DLQStatus) (*entity.DLQMessage, error) {
+	event, err := unmarshalStreamMessage(msg)
+	if err != nil {
+		return nil, err
+	}
+
+	failedAt := time.Now().UTC()
+	if v, ok := msg.Body["failed_at"]; ok {
+		if t, err := time.Parse(time.RFC3339Nano, fmt.Sprintf("%v", v)); err == nil {
+			failedAt = t
+		}
+	}
+
+	return &entity.DLQMessage{
+		ID:         msg.ID,
+		Event:      event,
+		Reason:     reason,
+		RetryCount: retryCount,
+		FailedAt:   failedAt,
+		Consumer:   msg.Consumer,
+		Status:     status,
+	}, nil
 }
