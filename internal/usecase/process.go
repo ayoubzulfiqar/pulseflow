@@ -55,9 +55,17 @@ type ProcessUseCase struct {
 	maxPending   int
 	claimMinIdle time.Duration
 	running      int32 // atomic
+
+	// Optional: webhook delivery after successful processing.
+	destinations entity.DestinationRepository
+	filterer     entity.CELFilterer
+	deliverer    entity.WebhookDeliverer
+	tracer       entity.Tracer
 }
 
 // NewProcessUseCase creates a ProcessUseCase.
+// The destinations, filterer, deliverer, and tracer parameters are optional —
+// pass nil to disable CEL-filtered webhook delivery and tracing.
 func NewProcessUseCase(
 	stream entity.EventStream,
 	repo entity.EventRepository,
@@ -67,6 +75,10 @@ func NewProcessUseCase(
 	batchSize int,
 	maxPending int,
 	claimMinIdle time.Duration,
+	destinations entity.DestinationRepository,
+	filterer entity.CELFilterer,
+	deliverer entity.WebhookDeliverer,
+	tracer entity.Tracer,
 	logger *slog.Logger,
 	metrics *Metrics,
 ) *ProcessUseCase {
@@ -84,6 +96,10 @@ func NewProcessUseCase(
 		batchSize:     batchSize,
 		maxPending:    maxPending,
 		claimMinIdle:  claimMinIdle,
+		destinations:  destinations,
+		filterer:      filterer,
+		deliverer:     deliverer,
+		tracer:        tracer,
 	}
 }
 
@@ -155,6 +171,17 @@ func (uc *ProcessUseCase) consumeLoop(ctx context.Context, consumerName string) 
 // handleMessage processes a single stream message: unmarshal, process,
 // ack on success, or route to DLQ on failure.
 func (uc *ProcessUseCase) handleMessage(ctx context.Context, msg entity.StreamMessage) error {
+	// Extract trace context from stream message metadata and start a
+	// child span for the entire processing pipeline.
+	processCtx := ctx
+	if uc.tracer != nil {
+		processCtx, _ = uc.tracer.Start(ctx, "process.event")
+	}
+
+	// Inject trace metadata into the message body so downstream consumers
+	// can link spans.
+	traceMeta := extractTraceMetadata(msg.Body)
+
 	start := time.Now()
 
 	event, err := unmarshalStreamMessage(msg)
@@ -170,31 +197,36 @@ func (uc *ProcessUseCase) handleMessage(ctx context.Context, msg entity.StreamMe
 		return nil // don't re-throw; message is handled (via DLQ)
 	}
 
-	if err := uc.processor.Process(ctx, event); err != nil {
-	retryCount := getRetryCount(msg)
-	if retryCount >= MaxDLQRetries {
-		// Permanently locked — route to DLQ with a terminal reason.
-		_ = uc.stream.DeadLetterQueue(ctx, []entity.StreamMessage{msg}, fmt.Sprintf("max retries exceeded: %v", err))
-		// Persist to PostgreSQL for audit.
-		uc.persistDLQ(ctx, msg, fmt.Sprintf("max retries exceeded: %v", err), retryCount+1, entity.DLQStatusLocked)
-		if uc.metrics != nil {
-			uc.metrics.DLQLocked.Inc()
+	// Enrich event metadata with trace context for downstream propagation.
+	if traceMeta != nil {
+		event.EnrichMetadata(traceMeta)
+	}
+
+	if err := uc.processor.Process(processCtx, event); err != nil {
+		retryCount := getRetryCount(msg)
+		if retryCount >= MaxDLQRetries {
+			// Permanently locked — route to DLQ with a terminal reason.
+			_ = uc.stream.DeadLetterQueue(ctx, []entity.StreamMessage{msg}, fmt.Sprintf("max retries exceeded: %v", err))
+			// Persist to PostgreSQL for audit.
+			uc.persistDLQ(ctx, msg, fmt.Sprintf("max retries exceeded: %v", err), retryCount+1, entity.DLQStatusLocked)
+			if uc.metrics != nil {
+				uc.metrics.DLQLocked.Inc()
+			}
+			uc.logger.Error("process: event locked in DLQ after max retries",
+				"event_id", event.ID, "retry_count", retryCount, "error", err)
+			return nil
 		}
-		uc.logger.Error("process: event locked in DLQ after max retries",
+		// Temporary failure — re-queue to the stream with increased retry count.
+		reason := fmt.Sprintf("retry %d: %v", retryCount+1, err)
+		_ = uc.stream.DeadLetterQueue(ctx, []entity.StreamMessage{msg}, reason)
+		// Persist to PostgreSQL for audit.
+		uc.persistDLQ(ctx, msg, reason, retryCount+1, entity.DLQStatusPending)
+		uc.logger.Warn("process: event requeued to DLQ for retry",
 			"event_id", event.ID, "retry_count", retryCount, "error", err)
+		if uc.metrics != nil {
+			uc.metrics.DLQ.Inc()
+		}
 		return nil
-	}
-	// Temporary failure — re-queue to the stream with increased retry count.
-	reason := fmt.Sprintf("retry %d: %v", retryCount+1, err)
-	_ = uc.stream.DeadLetterQueue(ctx, []entity.StreamMessage{msg}, reason)
-	// Persist to PostgreSQL for audit.
-	uc.persistDLQ(ctx, msg, reason, retryCount+1, entity.DLQStatusPending)
-	uc.logger.Warn("process: event requeued to DLQ for retry",
-		"event_id", event.ID, "retry_count", retryCount, "error", err)
-	if uc.metrics != nil {
-		uc.metrics.DLQ.Inc()
-	}
-	return nil
 	}
 
 	// Success — ack the message.
@@ -203,14 +235,19 @@ func (uc *ProcessUseCase) handleMessage(ctx context.Context, msg entity.StreamMe
 		return err // let the consumer retry
 	}
 
+	// --- CEL-filtered webhook delivery (Phase 3) ---
+	// After successful processing, look up matching destinations,
+	// evaluate CEL filters, and deliver webhooks for matching events.
+	uc.deliverWebhooks(processCtx, event)
+
 	if uc.metrics != nil {
 		uc.metrics.Processed.WithLabelValues(event.Source, string(event.Type)).Inc()
 		uc.metrics.Duration.WithLabelValues("process").Observe(time.Since(start).Seconds())
 	}
 
-	uc.logger.Debug("process: event processed",
-		"event_id", event.ID, "source", event.Source, "type", event.Type,
-		"duration_ms", time.Since(start).Milliseconds())
+		uc.logger.Debug("process: event processed",
+			"event_id", event.ID, "source", event.Source, "type", event.Type,
+			"duration_ms", time.Since(start).Milliseconds(), "trace_id", entity.TraceIDFromContext(processCtx))
 
 	return nil
 }
@@ -250,12 +287,89 @@ func (uc *ProcessUseCase) persistDLQ(ctx context.Context, msg entity.StreamMessa
 
 	dlqMsg, err := uc.parseDLQFromStream(msg, reason, retryCount, status)
 	if err != nil {
-		uc.logger.Debug("process: parse dlq for persist", "error", err)
+		uc.logger.Debug("process: parse dlq for persist", "error", err, "stream_msg_id", msg.ID)
 		return
 	}
 
 	if err := uc.repo.StoreDLQ(ctx, dlqMsg); err != nil {
 		uc.logger.Warn("process: failed to persist dlq to postgres", "error", err, "dlq_id", msg.ID)
+	}
+}
+
+// deliverWebhooks handles CEL-filtered webhook delivery after successful
+// event processing. It looks up matching active destinations, evaluates
+// each destination's CEL filter expression against the event, and delivers
+// via the webhook sender only for matching destinations. Events with no
+// destinations or no CEL filter are passed through.
+//
+// Per-destination concurrency limiting is handled by the webhook adapter.
+// If concurrency is saturated, deliveries are deferred without burning
+// stream retry counts.
+func (uc *ProcessUseCase) deliverWebhooks(ctx context.Context, event *entity.Event) {
+	// Skip webhook delivery if any dependency is missing.
+	if uc.deliverer == nil || uc.destinations == nil {
+		return
+	}
+
+	dests, err := uc.destinations.ListActive(ctx, event.Type, event.Source)
+	if err != nil {
+		uc.logger.Error("process: list destinations for webhook", "error", err, "event_id", event.ID)
+		return
+	}
+	if len(dests) == 0 {
+		return
+	}
+
+	traceID := entity.TraceIDFromContext(ctx)
+	for _, dest := range dests {
+		if dest.IsDisabled() {
+			continue
+		}
+
+		// Evaluate CEL filter if configured (Phase 3).
+		if dest.CELFilter != "" {
+			if uc.filterer == nil {
+				uc.logger.Warn("process: destination has CEL filter but no filterer configured",
+					"dest_id", dest.ID, "event_id", event.ID)
+				continue
+			}
+			ok, err := uc.filterer.ShouldDeliver(ctx, dest.CELFilter, event)
+			if err != nil {
+				uc.logger.Error("process: cel filter evaluation failed",
+					"dest_id", dest.ID, "error", err, "event_id", event.ID)
+				continue
+			}
+			if !ok {
+				uc.logger.Debug("process: event filtered out by CEL rule",
+					"dest_id", dest.ID, "cel_filter", dest.CELFilter,
+					"event_id", event.ID, "trace_id", traceID)
+				continue
+			}
+		}
+
+		uc.logger.Debug("process: delivering webhook",
+			"dest_id", dest.ID, "event_id", event.ID, "trace_id", traceID)
+
+		// The webhook sender handles signing, concurrency limiting,
+		// retries, and HTTP 410 auto-disable.
+		uc.deliverer.Deliver(ctx, dest, event)
+	}
+}
+
+// extractTraceMetadata pulls trace propagation fields from a stream message's
+// body. Returns nil if no trace context is present.
+func extractTraceMetadata(body map[string]interface{}) map[string]string {
+	if body == nil {
+		return nil
+	}
+	traceID, hasTraceID := body["trace_id"]
+	spanID, hasSpanID := body["span_id"]
+	if !hasTraceID || !hasSpanID {
+		return nil
+	}
+	return map[string]string{
+		"trace_id": fmt.Sprintf("%v", traceID),
+		"span_id":  fmt.Sprintf("%v", spanID),
 	}
 }
 
