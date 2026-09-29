@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -14,6 +15,7 @@ import (
 	"github.com/ayoubzulfiqar/pulseflow/internal/usecase"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/adaptor"
+	"github.com/gofiber/websocket/v2"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
@@ -66,8 +68,14 @@ type Server struct {
 	cfg           *config.Config
 	ingestUC      *usecase.IngestUseCase
 	queryUC       *usecase.QueryUseCase
+	dlqUC         *usecase.DLQUseCase
+	replayUC      *usecase.EventReplayUseCase
+	stream        entity.EventStream
 	logger        *slog.Logger
 	metrics       *usecase.Metrics
+	wsBroadcaster *WebSocketBroadcaster
+	cbResetFn     func(ctx context.Context) error
+	tenantRepo    entity.TenantRepository
 	startTime     time.Time
 	redisHealthy  func() bool
 	dbHealthy     func() bool
@@ -81,6 +89,48 @@ func WithHealthChecks(redisFn, dbFn func() bool) ServerOption {
 	return func(s *Server) {
 		s.redisHealthy = redisFn
 		s.dbHealthy = dbFn
+	}
+}
+
+// WithDLQUseCase injects the DLQ management use case.
+func WithDLQUseCase(dlq *usecase.DLQUseCase) ServerOption {
+	return func(s *Server) {
+		s.dlqUC = dlq
+	}
+}
+
+// WithReplayUseCase injects the time-travel replay use case.
+func WithReplayUseCase(replay *usecase.EventReplayUseCase) ServerOption {
+	return func(s *Server) {
+		s.replayUC = replay
+	}
+}
+
+// WithWebSocketBroadcaster injects the WebSocket metrics broadcaster.
+func WithWebSocketBroadcaster(b *WebSocketBroadcaster) ServerOption {
+	return func(s *Server) {
+		s.wsBroadcaster = b
+	}
+}
+
+// WithStream injects the raw event stream (for DLQ/admin operations).
+func WithStream(stream entity.EventStream) ServerOption {
+	return func(s *Server) {
+		s.stream = stream
+	}
+}
+
+// WithCBRestFn injects a function to manually reset circuit breakers.
+func WithCBRestFn(fn func(ctx context.Context) error) ServerOption {
+	return func(s *Server) {
+		s.cbResetFn = fn
+	}
+}
+
+// WithTenantRepo injects the tenant repository for auth.
+func WithTenantRepo(repo entity.TenantRepository) ServerOption {
+	return func(s *Server) {
+		s.tenantRepo = repo
 	}
 }
 
@@ -141,6 +191,39 @@ func (s *Server) App() *fiber.App {
 	return s.app
 }
 
+// registerWebSocketRoutes wires WebSocket endpoints onto the router.
+// Uses github.com/gofiber/websocket/v2 for proper WebSocket upgrade.
+func (s *Server) registerWebSocketRoutes(v1 fiber.Router) {
+	v1.Get("/ws/metrics", websocket.New(func(ws *websocket.Conn) {
+		// Register the client with the broadcaster.
+		out, cleanup := s.wsBroadcaster.AddClient()
+		defer cleanup()
+
+		// Send a connection confirmation heartbeat.
+		heartbeat := HeartbeatEvent{
+			Type:      "connected",
+			Timestamp: time.Now().UTC(),
+		}
+		if err := ws.WriteJSON(heartbeat); err != nil {
+			return
+		}
+
+		// Close handler for cleanup.
+		ws.SetCloseHandler(func(code int, text string) error {
+			cleanup()
+			return nil
+		})
+
+		// Keep the connection open and stream broadcast messages.
+		for msg := range out {
+			ws.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if err := ws.WriteMessage(1, msg); err != nil {
+				return
+			}
+		}
+	}))
+}
+
 func (s *Server) registerMiddleware() {
 	s.app.Use(RequestID())
 	s.app.Use(Logger(s.logger))
@@ -152,6 +235,24 @@ func (s *Server) registerRoutes() {
 	v1.Post("/events", s.Ingest)
 	v1.Get("/events", s.Query)
 	v1.Get("/events/:id", s.GetByID)
+
+	// WebSocket metrics route.
+	if s.wsBroadcaster != nil {
+		s.registerWebSocketRoutes(v1)
+	}
+
+	// Admin routes — DLQ management, replay, circuit breaker control.
+	if s.dlqUC != nil && s.replayUC != nil {
+		deps := &AdminDeps{
+			DLQ:        s.dlqUC,
+			Replay:     s.replayUC,
+			Metrics:    s.metrics,
+			Stream:     s.stream,
+			CBResetFn:  s.cbResetFn,
+			TenantRepo: s.tenantRepo,
+		}
+		RegisterAdminRoutes(v1, deps)
+	}
 
 	s.app.Get("/health", s.Health)
 	s.app.Get("/health/live", s.LiveProbe)
