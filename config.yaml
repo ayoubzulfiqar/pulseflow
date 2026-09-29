@@ -48,13 +48,9 @@ events:
 
 webhooks:
   enabled: false
-  # endpoints:
-  #   - url: "https://example.com/webhook"
-  #     secret: "your-shared-secret"
-  #     timeout: 5s
-  #     retries: 3
-  #     retry_delay: 200ms
-  endpoints: []
+  timeout: 30s
+  max_retries: 3
+  retry_delay: 5s
 
 rate_limit:
   enabled: true
@@ -83,5 +79,6 @@ metrics:
 tracing:
   enabled: false
   service_name: "pulseflow"
-  endpoint: "localhost:4317"
+  exporter: "otlphttp"
+  endpoint: "localhost:4318"
   sample_rate: 1.0
