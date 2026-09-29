@@ -27,6 +27,7 @@ type Config struct {
 	Logging    LoggingConfig    `mapstructure:"logging"`
 	Metrics    MetricsConfig    `mapstructure:"metrics"`
 	Tracing    TracingConfig    `mapstructure:"tracing"`
+	Admin      AdminConfig      `mapstructure:"admin"`
 }
 
 type AppConfig struct {
@@ -123,6 +124,14 @@ type TracingConfig struct {
 	SampleRate float64 `mapstructure:"sample_rate"`
 }
 
+// AdminConfig controls the admin control plane.
+type AdminConfig struct {
+	AuthRequired bool `mapstructure:"auth_required"`
+}
+
+// Add Admin to Config.
+// (inserted below)
+
 // LoadConfig reads configuration from file and environment variables.
 // When configPath is empty, it searches: ./config.yaml, $PWD/config.yaml,
 // and the executable directory.
@@ -187,6 +196,7 @@ func LoadConfig(configPath string) (*Config, error) {
 	v.SetDefault("metrics.path", "/metrics")
 	v.SetDefault("tracing.service_name", "pulseflow")
 	v.SetDefault("tracing.sample_rate", 1.0)
+	v.SetDefault("admin.auth_required", false)
 
 	var cfg Config
 	if err := v.Unmarshal(&cfg); err != nil {
