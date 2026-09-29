@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ayoubzulfiqar/pulseflow/internal/adapter/api/middleware"
 	"github.com/ayoubzulfiqar/pulseflow/internal/config"
 	"github.com/ayoubzulfiqar/pulseflow/internal/entity"
 	"github.com/ayoubzulfiqar/pulseflow/internal/usecase"
@@ -17,6 +18,7 @@ import (
 	"github.com/gofiber/fiber/v2/middleware/adaptor"
 	"github.com/gofiber/websocket/v2"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // IngestRequest is the JSON body for POST /v1/events.
@@ -79,6 +81,7 @@ type Server struct {
 	startTime     time.Time
 	redisHealthy  func() bool
 	dbHealthy     func() bool
+	tracer        trace.Tracer
 }
 
 // ServerOption configures the Server.
@@ -131,6 +134,13 @@ func WithCBRestFn(fn func(ctx context.Context) error) ServerOption {
 func WithTenantRepo(repo entity.TenantRepository) ServerOption {
 	return func(s *Server) {
 		s.tenantRepo = repo
+	}
+}
+
+// WithTracer injects an OpenTelemetry tracer for request tracing.
+func WithTracer(tracer trace.Tracer) ServerOption {
+	return func(s *Server) {
+		s.tracer = tracer
 	}
 }
 
@@ -226,6 +236,9 @@ func (s *Server) registerWebSocketRoutes(v1 fiber.Router) {
 
 func (s *Server) registerMiddleware() {
 	s.app.Use(RequestID())
+	if s.tracer != nil {
+		s.app.Use(middleware.Tracing(s.tracer))
+	}
 	s.app.Use(Logger(s.logger))
 	s.app.Use(Recover(s.logger))
 }
