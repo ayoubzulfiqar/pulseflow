@@ -39,4 +39,11 @@ var (
 	// ErrDLQOperationNotAllowed is returned when a DLQ operation is invalid
 	// for the current message status (e.g. retry on a locked message).
 	ErrDLQOperationNotAllowed = errors.New("entity: dlq operation not allowed")
+
+	// ErrDestinationDisabled is returned when attempting to deliver to
+	// a destination that has been auto-disabled (e.g. after HTTP 410).
+	ErrDestinationDisabled = errors.New("entity: destination is disabled")
+
+	// ErrCELFilter is returned when a CEL filter expression fails to compile.
+	ErrCELFilter = errors.New("entity: cel filter compilation failed")
 )
