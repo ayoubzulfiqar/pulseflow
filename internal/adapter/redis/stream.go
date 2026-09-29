@@ -270,5 +270,134 @@ func buildDLQValues(body map[string]interface{}, reason string, retryCount int) 
 	return values
 }
 
+// PurgeDLQ removes all messages from the dead-letter queue stream.
+// Returns the number of entries deleted.
+func (s *Stream) PurgeDLQ(ctx context.Context) (int, error) {
+	// XRANGE to get all IDs, then XDEL them.
+	msgs, err := s.client.XRange(ctx, s.dlqStream, "-", "+").Result()
+	if err != nil {
+		return 0, fmt.Errorf("redis: xrange dlq: %w", err)
+	}
+
+	if len(msgs) == 0 {
+		return 0, nil
+	}
+
+	ids := make([]string, len(msgs))
+	for i, msg := range msgs {
+		ids[i] = msg.ID
+	}
+
+	deleted, err := s.client.XDel(ctx, s.dlqStream, ids...).Result()
+	if err != nil {
+		return 0, fmt.Errorf("redis: xdel dlq: %w", err)
+	}
+
+	return int(deleted), nil
+}
+
+// ListDLQ reads messages from the dead-letter queue stream via XRANGE.
+// When limit > 0, at most `limit` messages are returned. When offset > 0,
+// the first `offset` messages are skipped.
+func (s *Stream) ListDLQ(ctx context.Context, limit, offset int) ([]entity.StreamMessage, error) {
+	count := int64(limit)
+	if count <= 0 {
+		count = 1000 // default page size
+	}
+
+	// XRangeN with count for efficient pagination.
+	msgs, err := s.client.XRangeN(ctx, s.dlqStream, "-", "+", count).Result()
+	if err != nil {
+		return nil, fmt.Errorf("redis: xrange dlq: %w", err)
+	}
+
+	// Skip offset.
+	if offset > 0 && offset < len(msgs) {
+		msgs = msgs[offset:]
+	} else if offset >= len(msgs) {
+		return nil, nil
+	}
+
+	// Apply limit after offset.
+	if limit > 0 && len(msgs) > limit {
+		msgs = msgs[:limit]
+	}
+
+	result := make([]entity.StreamMessage, len(msgs))
+	for i, msg := range msgs {
+		result[i] = entity.StreamMessage{
+			ID:       msg.ID,
+			Stream:   s.dlqStream,
+			Consumer: "", // DLQ messages are not tied to a consumer
+			Body:     msg.Values,
+		}
+	}
+
+	return result, nil
+}
+
+// RequeueDLQ moves messages from the DLQ stream back to the main stream.
+// It reads each message from the DLQ, re-publishes it to the main stream
+// with retry_count reset to 0, and then deletes it from the DLQ.
+func (s *Stream) RequeueDLQ(ctx context.Context, ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+
+	// Fetch the DLQ messages via XRange to get all bodies.
+	msgs, err := s.client.XRange(ctx, s.dlqStream, "-", "+").Result()
+	if err != nil {
+		return fmt.Errorf("redis: xrange dlq for requeue: %w", err)
+	}
+
+	// Build a set of requested IDs.
+	requested := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		requested[id] = true
+	}
+
+	pipe := s.client.TxPipeline()
+	queuedCount := 0
+
+	for _, msg := range msgs {
+		if !requested[msg.ID] {
+			continue
+		}
+
+		// Copy the body, reset retry_count to 0.
+		values := make(map[string]interface{}, len(msg.Values))
+		for k, v := range msg.Values {
+			if k == "retry_count" {
+				values[k] = "0"
+			} else {
+				values[k] = v
+			}
+		}
+
+		// Re-publish to the main stream.
+		pipe.XAdd(ctx, &rd.XAddArgs{
+			Stream: s.stream,
+			Values: values,
+			MaxLen: int64(s.maxLen),
+			Approx: true,
+		})
+
+		// Delete from the DLQ.
+		pipe.XDel(ctx, s.dlqStream, msg.ID)
+		queuedCount++
+	}
+
+	if queuedCount == 0 {
+		return nil
+	}
+
+	if _, err := pipe.Exec(ctx); err != nil {
+		return fmt.Errorf("redis: requeue dlq pipeline: %w", err)
+	}
+
+	s.logger.Info("dlq: requeued messages", "count", queuedCount)
+	return nil
+}
+
 // partitionNamePattern validates generated partition names to prevent injection.
 var partitionNamePattern = regexp.MustCompile(`^[a-z_][a-z0-9_]*$`)
