@@ -594,6 +594,84 @@ webhooks:
       retry_delay: 200ms
 ```
 
+## Observability
+
+### OpenTelemetry Tracing
+
+PulseFlow includes built-in OpenTelemetry instrumentation for distributed tracing. When enabled, every HTTP request is instrumented with a trace span, and trace context (trace ID, span ID) is propagated through Redis Streams for end-to-end visibility.
+
+```yaml
+tracing:
+  enabled: true
+  service_name: "pulseflow"
+  exporter: "otlphttp"
+  endpoint: "localhost:4318"
+  sample_rate: 1.0
+```
+
+**Supported exporters:**
+- `otlphttp` — OTLP HTTP exporter (default, port 4318)
+- `otlpgrpc` — OTLP gRPC exporter (port 4317)
+
+Trace context is automatically extracted from incoming `traceparent` HTTP headers and injected into event metadata during ingestion. When consuming from Redis Streams, the consumer extracts trace context from the message body and starts a child span, enabling distributed trace correlation across the ingestion → processing → webhook delivery pipeline.
+
+### Distributed Tracing Flow
+
+```
+HTTP Request → Tracing Middleware (start span) → IngestUseCase (inject trace_id/span_id)
+  → Redis Stream (propagate metadata) → ProcessUseCase (start child span)
+  → Webhook Sender (propagate traceparent to downstream)
+```
+
+## Advanced Webhook Delivery
+
+### Dual-Secret Rotation (Zero-Downtime)
+
+Webhook destinations support zero-downtime secret rotation. When rotating a signing secret:
+
+1. Set `secondary_secret` to the new key and `rotation_expires_at` to the rotation deadline (e.g. 24h).
+2. During the rotation window, outgoing payloads are signed with **both** the primary and secondary secrets.
+3. Receivers verify against either key.
+4. Once the rotation window expires, promote the secondary to primary and clear the secondary field.
+
+**Signature header format:**
+```
+X-PulseFlow-Signature: v1=<hash_primary>,v1=<hash_secondary>
+```
+
+When only the primary secret is configured (no rotation in progress), a single `v1=<hash_primary>` is emitted.
+
+### HTTP 410 Gone Auto-Disabling
+
+If a webhook destination responds with HTTP `410 Gone`, the destination is immediately marked as `disabled` in PostgreSQL. The consumer skips disabled destinations for all subsequent deliveries, preventing repeated failed deliveries to decommissioned endpoints.
+
+### CEL Payload Filtering
+
+Destinations can specify a CEL (Common Expression Language) expression to conditionally receive events. The expression is evaluated in the `ProcessUseCase` before attempting webhook delivery — if the event does not match, delivery is skipped gracefully without consuming a retry attempt.
+
+Available variables in CEL expressions:
+- `event.id` — event ULID
+- `event.type` — event type (e.g. `"order.created"`)
+- `event.source` — event source
+- `event.subject` — event subject
+- `event.data` — parsed JSON payload (e.g. `event.data.amount`)
+- `event.metadata` — metadata map (e.g. `event.metadata.trace_id`)
+- `event.timestamp` — ISO-8601 timestamp string
+- `event.version` — schema version
+
+**Examples:**
+```
+event.type == 'order.created' && event.data.amount > 100
+event.source == 'billing-service' && event.data.status == 'succeeded'
+event.metadata['priority'] == 'high' || event.data.amount > 1000
+```
+
+### Per-Destination Concurrency Limiting
+
+Each webhook destination has a configurable `concurrency_limit` (default: 5). When the concurrent in-flight request count for a destination URL exceeds this limit, the delivery is **deferred** (not retried) — the worker waits and retries without consuming a stream retry count. This prevents overwhelming downstream endpoints under burst traffic while preserving retry budget for genuine failures.
+
+The concurrency limiter is implemented as a Redis-backed distributed semaphore using a Lua script for atomic increment/check/decrement operations, with a 60-second TTL to automatically clean up stale locks from crashed workers.
+
 ## Deployment
 
 ### Docker
