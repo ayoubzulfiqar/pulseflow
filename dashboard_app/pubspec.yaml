@@ -1,0 +1,22 @@
+name: pulseflow_dashboard
+description: "PulseFlow Enterprise Control Plane Dashboard — real-time event pipeline monitoring, DLQ management, and circuit breaker control."
+publish_to: "none"
+version: 1.0.0
+environment:
+  sdk: ">=3.3.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  http: ^1.1.0
+  web_socket_channel: ^3.0.1
+  intl: ^0.19.0
+  material_design_icons_flutter: ^7.0.7296
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
