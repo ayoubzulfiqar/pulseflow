@@ -7,21 +7,21 @@ Production-grade event ingestion, processing, and delivery platform. Built for h
 PulseFlow is an event-driven pipeline that ingests domain events via HTTP, persists them durably, publishes them to a Redis Streams consumer-group topology for asynchronous processing, and delivers signed webhook notifications to downstream systems. Designed for horizontal scaling, zero-downtime deploys, and graceful degradation under partial infrastructure failure.
 
 **Key differentiators:**
-|- Dual write path (durability + streaming) — events are persisted to PostgreSQL *and* published to Redis Streams before acknowledgement
-|- Consumer group with XCLAIM failover — dead workers' messages are automatically reclaimed
-|- Dead-letter queue with retry isolation — failed messages are quarantined after configurable retries (default: 5)
-|- Time-travel replay engine — reprocess historical events from PostgreSQL within any time window
-|- HMAC-SHA256 webhook signing with timestamp anti-replay — signed payloads with configurable tolerance window
-|- Zero-downtime dual-secret rotation — rotate webhook signing keys without service interruption
-|- Conditional delivery via CEL expressions — filter events per-destination using Common Expression Language
-|- Per-destination concurrency limiting — Redis-backed distributed semaphores prevent downstream overload
-|- HTTP 410 Gone auto-disable — decommissioned endpoints are automatically disabled after a Gone response
-|- Circuit breaker on the streaming layer — prevents cascade failures when Redis is unavailable
-|- Multi-tenant isolation — per-tenant API keys, rate limits, and audit trails
-|- PostgreSQL RANGE partitioning — monthly partitions for high-throughput long-term retention
-|- Distributed tracing via OpenTelemetry — W3C TraceContext propagation through HTTP and Redis Streams
-|- Structured observability — Prometheus metrics, JSON structured logs, real-time WebSocket metrics stream
-|- Enterprise control-plane API — full DLQ management, time-travel replay, and circuit breaker reset
+- Events are saved to PostgreSQL and published to Redis Streams before responding — no data loss if the stream is slow
+- Dead workers' messages are automatically reclaimed by other consumers via XCLAIM
+- Failed messages go to a dead-letter queue (DLQ) with configurable retries (default: 5)
+- Replay historical events from PostgreSQL within any time window
+- Webhook payloads are signed with HMAC-SHA256 and include a timestamp to prevent replay attacks
+- Rotate webhook signing keys without downtime using dual-secret mode
+- Filter which events each destination receives using CEL expressions (Common Expression Language)
+- Each destination has a configurable concurrency limit. Redis-backed semaphores prevent overwhelming downstream services
+- If a destination returns HTTP 410 Gone, it is automatically disabled in PostgreSQL
+- Circuit breaker protects against Redis failures
+- Each tenant gets its own API keys, rate limits, and audit trail
+- PostgreSQL partitions event data by month for fast reads and easy cleanup
+- OpenTelemetry tracing shows the full path of every event across HTTP and Redis Streams
+- Prometheus metrics, JSON logs, and a real-time WebSocket metrics stream
+- API for managing DLQ, replaying events, and resetting circuit breakers
 
 ## Control Plane API
 
@@ -636,9 +636,7 @@ webhooks:
 
 ## Observability
 
-### OpenTelemetry Tracing
-
-PulseFlow includes built-in OpenTelemetry instrumentation for distributed tracing. When enabled, every HTTP request is instrumented with a trace span, and trace context (trace ID, span ID) is propagated through Redis Streams for end-to-end visibility.
+PulseFlow sends traces to any OpenTelemetry-compatible backend (Jaeger, Tempo, Honeycomb, Datadog, etc.). Tracing is off by default.
 
 ```yaml
 tracing:
@@ -653,7 +651,7 @@ tracing:
 - `otlphttp` — OTLP HTTP exporter (default, port 4318)
 - `otlpgrpc` — OTLP gRPC exporter (port 4317)
 
-Trace context is automatically extracted from incoming `traceparent` HTTP headers and injected into event metadata during ingestion. When consuming from Redis Streams, the consumer extracts trace context from the message body and starts a child span, enabling distributed trace correlation across the ingestion → processing → webhook delivery pipeline.
+Each HTTP request gets a trace span. Trace context (trace ID, span ID) flows through Redis Streams, so you can follow an event from ingestion through processing to webhook delivery.
 
 ### Distributed Tracing Flow
 
@@ -665,7 +663,9 @@ HTTP Request → Tracing Middleware (start span) → IngestUseCase (inject trace
 
 ## Advanced Webhook Delivery
 
-### Dual-Secret Rotation (Zero-Downtime)
+This section covers how webhook delivery works and how to manage destination endpoints.
+
+### Rotating Webhook Signing Keys
 
 Webhook destinations support zero-downtime secret rotation. When rotating a signing secret:
 
@@ -685,9 +685,9 @@ When only the primary secret is configured (no rotation in progress), a single `
 
 If a webhook destination responds with HTTP `410 Gone`, the destination is immediately marked as `disabled` in PostgreSQL. The consumer skips disabled destinations for all subsequent deliveries, preventing repeated failed deliveries to decommissioned endpoints.
 
-### CEL Payload Filtering
+### Filtering Events with CEL
 
-Destinations can specify a CEL (Common Expression Language) expression to conditionally receive events. The expression is evaluated in the `ProcessUseCase` before attempting webhook delivery — if the event does not match, delivery is skipped gracefully without consuming a retry attempt.
+Each destination can have a CEL expression that decides which events it receives. The expression runs before delivery. If it returns false, the event is skipped without wasting a retry attempt.
 
 Available variables in CEL expressions:
 - `event.id` — event ULID
@@ -706,9 +706,9 @@ event.source == 'billing-service' && event.data.status == 'succeeded'
 event.metadata['priority'] == 'high' || event.data.amount > 1000
 ```
 
-### Per-Destination Concurrency Limiting
+### Limiting Concurrent Requests Per Destination
 
-Each webhook destination has a configurable `concurrency_limit` (default: 5). When the concurrent in-flight request count for a destination URL exceeds this limit, the delivery is **deferred** (not retried) — the worker waits and retries without consuming a stream retry count. This prevents overwhelming downstream endpoints under burst traffic while preserving retry budget for genuine failures.
+Each destination has a `concurrency_limit` (default: 5). If more than this many webhook deliveries are in flight at the same time for the same destination, new deliveries are deferred until a slot frees up. This prevents overloading downstream services without wasting retry attempts.
 
 The concurrency limiter is implemented as a Redis-backed distributed semaphore using a Lua script for atomic increment/check/decrement operations, with a 60-second TTL to automatically clean up stale locks from crashed workers.
 
@@ -773,7 +773,7 @@ On `SIGINT`/`SIGTERM`:
 
 ### Prerequisites
 
-- Go 1.24+
+- Go 1.25+
 - Redis 7+
 - PostgreSQL 16+
 
@@ -816,28 +816,46 @@ pulseflow/
 │   │   │   ├── middleware.go   # RequestID, Logger, Recover, RateLimiter
 │   │   │   ├── auth.go         # API key auth + per-tenant rate limiting
 │   │   │   ├── admin.go        # DLQ, replay, circuit breaker endpoints
-│   │   │   └── websocket.go    # WebSocket broadcaster + metrics streaming
+│   │   │   ├── websocket.go    # WebSocket broadcaster + metrics streaming
+│   │   │   └── middleware/
+│   │   │       └── tracing.go  # OpenTelemetry distributed tracing middleware
 │   │   ├── postgres/           # Persistence (pgx v5, embedded migrations)
 │   │   │   ├── event.go        # EventRepository + partition management
 │   │   │   ├── dlq.go          # DLQRepository methods
 │   │   │   ├── tenant.go       # TenantRepository (multi-tenant)
+│   │   │   ├── destination.go  # DestinationRepository (webhook targets)
 │   │   │   └── migrations/
-│   │   └── redis/              # Streaming (XADD, XREADGROUP, XCLAIM, DLQ)
-│   │       ├── stream.go       # Stream adapter + DLQ management
-│   │       ├── circuitbreaker.go  # sony/gobreaker wrapper
-│   │       └── circuitbreaker_state.go  # State adapter for admin queries
+│   │   ├── redis/              # Streaming (XADD, XREADGROUP, XCLAIM, DLQ)
+│   │   │   ├── stream.go       # Stream adapter + DLQ management
+│   │   │   ├── concurrency.go  # Redis-backed concurrency limiter (Lua script)
+│   │   │   ├── circuitbreaker.go  # sony/gobreaker wrapper
+│   │   │   └── circuitbreaker_state.go  # State adapter for admin queries
+│   │   ├── tracing/            # OpenTelemetry provider + propagator
+│   │   │   ├── tracing.go      # InitTracer + OTLP HTTP/gRPC exporter
+│   │   │   └── propagator.go   # W3C TraceContext HTTP/Redis propagation
+│   │   ├── filter/             # CEL payload filtering
+│   │   │   └── cel.go          # RuleEngine with compiled-program cache
+│   │   └── webhook/            # Signed webhook delivery
+│   │       └── sender.go       # Dual-secret HMAC-SHA256, 410 auto-disable, backoff
 │   ├── config/                 # Viper-based loader
 │   ├── entity/                 # Domain (zero deps)
 │   │   ├── event.go            # Event entity, validation
 │   │   ├── dlq.go              # DLQMessage entity, DLQFilter
 │   │   ├── tenant.go           # Tenant, APIKey entities
-│   ├── usecase/                # Application layer
-│   │   ├── ingest.go
-│   │   ├── process.go
-│   │   ├── query.go
-│   │   ├── dlq.go              # DLQ management use case
-│   │   ├── replay.go           # Time-travel replay engine
-│   │   └── metrics.go          # Prometheus metric wrappers
+│   │   ├── destination.go      # Destination entity (dual-secret, CEL, concurrency)
+│   │   ├── destination_repository.go  # Ports for destinations, webhooks, CEL, concurrency
+│   │   ├── tracing.go          # Propagator interface, Tracer alias, trace keys
+│   │   ├── errors.go           # Domain error sentinels
+│   │   └── repository.go       # EventRepository, EventStream ports
+│   └── usecase/                # Application layer
+│       ├── ingest.go
+│       ├── process.go          # Consumer workers + webhook delivery + tracing
+│       ├── query.go
+│       ├── dlq.go              # DLQ management use case
+│       ├── replay.go           # Time-travel replay engine
+│       ├── webhook.go          # Webhook deliverer interface
+│       ├── metrics.go          # Prometheus metric wrappers
+│       └── errors.go           # Usecase error sentinels
 ├── go.mod
 └── README.md
 ```
