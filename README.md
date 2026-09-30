@@ -7,22 +7,26 @@ Production-grade event ingestion, processing, and delivery platform. Built for h
 PulseFlow is an event-driven pipeline that ingests domain events via HTTP, persists them durably, publishes them to a Redis Streams consumer-group topology for asynchronous processing, and delivers signed webhook notifications to downstream systems. Designed for horizontal scaling, zero-downtime deploys, and graceful degradation under partial infrastructure failure.
 
 **Key differentiators:**
-|- Events are saved to PostgreSQL and published to Redis Streams before responding — no data loss if the stream is slow
-|- Dead workers' messages are automatically reclaimed by other consumers via XCLAIM
-|- Failed messages go to a dead-letter queue (DLQ) with configurable retries (default: 5)
-|- Replay historical events from PostgreSQL within any time window
-|- Webhook payloads are signed with HMAC-SHA256 and include a timestamp to prevent replay attacks
-|- Rotate webhook signing keys without downtime using dual-secret mode
-|- Filter which events each destination receives using CEL expressions (Common Expression Language)
-|- Each destination has a configurable concurrency limit. Redis-backed semaphores prevent overwhelming downstream services
-|- If a destination returns HTTP 410 Gone, it is automatically disabled in PostgreSQL
-|- Circuit breaker protects against Redis failures
-|- Each tenant gets its own API keys, rate limits, and audit trail
-|- PostgreSQL partitions event data by month for fast reads and easy cleanup
-|- OpenTelemetry tracing shows the full path of every event across HTTP and Redis Streams
-|- Prometheus metrics, JSON logs, and a real-time WebSocket metrics stream
-|- API for managing DLQ, replaying events, and resetting circuit breakers
-|- **White-Label Embed**: iframe-ready React component for SaaS platforms to embed webhook management
+- Events are saved to PostgreSQL and published to Redis Streams before responding — no data loss if the stream is slow
+- Dead workers' messages are automatically reclaimed by other consumers via XCLAIM
+- Failed messages go to a dead-letter queue (DLQ) with configurable retries (default: 5)
+- Replay historical events from PostgreSQL within any time window
+- Webhook payloads are signed with HMAC-SHA256 and include a timestamp to prevent replay attacks
+- Rotate webhook signing keys without downtime using dual-secret mode
+- Filter which events each destination receives using CEL expressions
+- Each destination has a configurable concurrency limit. Redis-backed semaphores prevent overwhelming downstream services
+- If a destination returns HTTP 410 Gone, it is automatically disabled in PostgreSQL
+- Circuit breaker protects against Redis failures
+- Each tenant gets its own API keys, rate limits, and audit trail
+- PostgreSQL partitions event data by month for fast reads and easy cleanup
+- OpenTelemetry tracing shows the full path of every event across HTTP and Redis Streams
+- Prometheus metrics, JSON logs, and a real-time WebSocket metrics stream
+- API for managing DLQ, replaying events, and resetting circuit breakers
+- White-label embed component allows B2B SaaS platforms to embed webhook management via iframe
+- Native event batching aggregates events before delivery to prevent receiver overload
+- Schema validation catches breaking payload changes before they reach customers
+- Ingress deduplication provides exactly-once semantics for fintech and e-commerce
+- Dead Man's Switch alerts proactively when destinations go silent
 
 ## Control Plane API
 
@@ -258,6 +262,8 @@ POST /v1/events
      ▼
 [usecase/ingest.go] — IngestUseCase
   • Validate event (business rules)
+  • Ingress deduplication check (if enabled) — returns 200 OK for duplicates
+  • Schema validation (if enabled) — routes invalid events to DLQ
   • Enrich metadata (ingested_at, trace_id)
   • Store to PostgreSQL (write-ahead durability)
   • Publish to Redis Stream (fan-out)
@@ -458,6 +464,12 @@ Configuration is loaded from `config.yaml` (in CWD or `/etc/pulseflow/config.yam
 | | `tracing.sample_rate` | `1.0` | Trace sampling ratio |
 | **Transformation** | `transformation.enabled` | `false` | Enable JS payload transformation |
 | | `transformation.timeout` | `500ms` | Script execution timeout |
+| **Schema Validation** | `schema_validation.enabled` | `false` | Enable JSON Schema validation for event payloads |
+| | `schema_validation.dlq_on_failure` | `true` | Route invalid events to DLQ |
+| **Deduplication** | `deduplication.enabled` | `false` | Enable ingress deduplication (exactly-once) |
+| | `deduplication.window` | `1h` | Deduplication time window |
+| **Monitor** | `monitor.enabled` | `false` | Enable Dead Man's Switch alerting |
+| | `monitor.check_interval` | `5m` | Heartbeat check interval |
 | **Compliance** | `compliance.pii_enabled` | `false` | Enable PII/PHI redaction |
 | | `compliance.audit_enabled` | `false` | Enable signed audit trail |
 | | `compliance.audit_secret` | *(empty)* | HMAC secret for audit signing |
@@ -567,16 +579,17 @@ Prometheus metrics endpoint.
 
 ## Web Dashboard
 
-The PulseFlow dashboard has been replaced by the **Embeddable White-Label Component** — an iframe-ready React package (`@pulseflow/embed`) that B2B SaaS platforms can embed directly in their own applications. See the [embed README](embed/README.md) for integration and usage details.
+PulseFlow provides an embeddable white-label component (`@pulseflow/embed`) — an iframe-ready React package that B2B SaaS platforms can embed directly in their own applications. This replaces the previous Flutter dashboard.
 
 ### Features
 - **Delivery Logs**: view recent webhook delivery attempts (delivered, failed, filtered)
 - **Endpoint Management**: list webhook destinations, view their configuration
-- **Retry Controls**: one-click retry for failed deliveries (if not read-only)
+- **Retry Controls**: one-click retry for failed deliveries (disabled in read-only mode)
 - **Tenant Scoping**: all data is automatically filtered to the caller's tenant ID
 - **Branding**: fully customizable colors, logo, font, and corner radius
 - **Read-Only Mode**: disable all write operations when needed
-```
+
+See the [embed README](embed/README.md) for full integration and usage details.
 
 ## Security
 
@@ -700,9 +713,9 @@ event.metadata['priority'] == 'high' || event.data.amount > 1000
 
 ## Enterprise Features
 
-PulseFlow provides three enterprise-grade capability wedges that can be enabled independently in configuration:
+PulseFlow provides enterprise-grade capability wedges that can be enabled independently in configuration:
 
-### 1. Embedded White-Label Component
+### 1. Embedded White-Label Component (B2B SaaS Wedge)
 
 B2B SaaS companies (CRMs, HR tools, etc.) can embed webhook management directly into their application using an iframe-ready React package. End-users manage their own webhook endpoints, view delivery logs, and retry failures — all scoped to the parent SaaS's tenant ID.
 
@@ -742,64 +755,91 @@ embed:
 
 API endpoints: `/v1/embed/token`, `/v1/embed/destinations`, `/v1/embed/deliveries`, `/v1/embed/events`, `/v1/embed/deliveries/:id/retry`.
 
-### 2. AI Agent Event Router
+### 2. Smart Event Batching & Aggregation (Anti-Spam Wedge)
 
-Transforms messy, unstructured AI/LLM event output into clean, schema-validated payloads before delivery. Developers write a 5-line JavaScript snippet in the dashboard — no code deploys needed.
+Receivers hate getting 500 individual `item_added_to_cart` webhooks in a minute. Batching lets destinations configure a rule like "aggregate cart events, wait up to 30 seconds or 50 events, whichever comes first, then send as a single JSON array."
 
-**How it works:**
-1. AI agent produces an event with raw LLM output
-2. A JavaScript transformation script maps the output to the destination's expected schema
-3. The transformed payload is validated against a JSON schema
-4. Only validated payloads are delivered to webhook destinations
+Events are held in a Redis Sorted Set (ZSET) with timestamp scores. When the batch size is reached or the max wait duration elapses, a Lua script atomically drains the set and delivers a single payload with the array of all events.
 
-**Enable in config:**
+**Configuration:**
 ```yaml
-transformation:
+# Batching is configured per-destination via the batch_size and max_wait fields.
+# Example destination config:
+destinations:
+  - url: https://api.example.com/webhook
+    event_type: "cart.*"
+    batch_size: 50          # max events per batch
+    max_wait: 30s           # flush after this duration regardless of batch size
+```
+
+API endpoints: `/v1/embed/destinations`, `/v1/admin/destinations`.
+
+### 3. Webhook Contract Testing & Schema Validation (No More Breaking Changes Wedge)
+
+When a SaaS company changes their webhook payload (e.g., renames `user_id` to `userId`), the receiving customer's integration silently breaks. PulseFlow validates incoming events against registered JSON Schemas before they are accepted or delivered. If validation fails, the event goes to a dedicated "Schema Violation" DLQ and an alert is triggered.
+
+**Configuration:**
+```yaml
+schema_validation:
   enabled: true
-  timeout: 500ms
+  dlq_on_failure: true
 ```
 
-**Example transformation script:**
-```javascript
-var match = event.data.llm_output.match(/Customer: (.+?), Amount: \$([\d,.]+)/);
-return {
-  customer: match[1].trim(),
-  amount: parseFloat(match[2].replace(/,/g, "")),
-  source: "ai_agent"
-};
+Register schemas via the API:
+```bash
+curl -X POST https://api.pulseflow.dev/v1/admin/schemas \
+  -H "X-API-Key: pk_..." \
+  -H "Content-Type: application/json" \
+  -d '{
+    "event_pattern": "billing:order.*",
+    "schema": {
+      "type": "object",
+      "properties": {"amount": {"type": "number"}, "currency": {"type": "string"}},
+      "required": ["amount"]
+    }
+  }'
 ```
 
-Scripts run in a sandboxed JS VM (otto) with execution timeouts and dangerous globals stripped.
+Invalid events are routed to the DLQ with `reason: "schema_violation"`.
 
-### 3. Compliance-First Pipeline
+### 4. Native Ingress Deduplication (Exactly-Once Wedge)
 
-For healthtech, fintech, and EU-based teams that need SOC 2/HIPAA-ready event delivery with immutable audit proof.
+Network glitches cause senders to retry HTTP requests, resulting in duplicate event ingestion. PulseFlow can deduplicate at ingress using a configurable time window (default: 1 hour). When a duplicate arrives, PulseFlow returns 200 OK (satisfying the sender's retry) but silently drops the event — preventing double-processing and double-billing.
 
-**PII/PHI Redaction:**
-Automatically redacts SSNs, emails, credit card numbers, phone numbers, and API keys from event data and metadata using regex patterns before anything is written to PostgreSQL (DLQ), logs, or delivered to webhooks.
+Uses `Idempotency-Key` header or a content hash (SHA-256 of source + type + subject + payload) checked against a Redis SETNX with TTL.
 
+**Configuration:**
 ```yaml
-compliance:
-  pii_enabled: true
-  redact_dlq: true
-  redact_logs: true
+deduplication:
+  enabled: true
+  window: 1h
 ```
 
-Default patterns: SSN, email, credit card, phone, API keys. Custom patterns can be added to the `pii_patterns` array.
+### 5. Proactive Dead Man's Switch Alerting (Peace of Mind Wedge)
 
-**Immutable Audit Trail:**
-Every delivery attempt (delivered, failed, filtered, skipped) is recorded with an HMAC-SHA256 signature, creating cryptographically verifiable proof of what was sent and when.
+A webhook destination doesn't fail with a 500 — it just silently stops receiving events because of a misconfigured firewall. With heartbeat expectations, destinations declare "I expect at least one `user.active` event every 24 hours." If PulseFlow detects a gap in successful deliveries, it fires an alert to Slack, Discord, or email via webhook.
 
+**Configuration:**
 ```yaml
-compliance:
-  audit_enabled: true
-  audit_secret: "your-hmac-signing-secret"
+monitor:
+  enabled: true
+  check_interval: 5m
 ```
 
-Audit records are stored in the `audit_records` table with indexes on `event_id`, `destination_id`, `status`, and `timestamp`. Query via:
+Configure a heartbeat expectation:
+```bash
+curl -X POST https://api.pulseflow.dev/v1/admin/heartbeats \
+  -H "X-API-Key: pk_..." \
+  -H "Content-Type: application/json" \
+  -d '{
+    "destination_id": "dest_123",
+    "event_type": "user.active",
+    "expected_interval": "24h",
+    "alert_webhook_url": "https://hooks.slack.com/services/..."
+  }'
 ```
-GET /v1/embed/deliveries?event_id=evt_123&status=delivered
-```
+
+The monitor worker runs on a configurable interval and checks all active expectations, comparing against the last successful delivery timestamp from the audit trail. Duplicate alerts are suppressed within the same gap window.
 
 ### Limiting Concurrent Requests Per Destination
 
@@ -890,67 +930,73 @@ pulseflow/
 ├── deploy/
 │   ├── Dockerfile              # Multi-stage build
 │   └── docker-compose.yml      # Full stack with tracing
-├── dashboard_app/               # Flutter control-plane dashboard (Web/Desktop/Mobile)
-│   ├── pubspec.yaml
-│   ├── lib/
-│   │   ├── main.dart
-│   │   ├── models/models.dart   # Data models (Event, DLQMessage, MetricsEvent, etc.)
-│   │   ├── services/
-│   │   │   ├── api_client.dart  # REST API client
-│   │   │   └── ws_client.dart   # WebSocket metrics client
-│   │   └── screens/
-│   │       ├── live_stream_monitor.dart  # Real-time graphs + metrics
-│   │       ├── dlq_operator.dart        # DLQ list/retry/purge
-│   │       ├── payload_inspector.dart   # Event search & replay
-│   │       └── circuit_breaker_panel.dart # Breaker state & reset
-│   └── web/index.html
+├── embed/                      # @pulseflow/embed React component
+│   ├── src/
+│   │   ├── index.tsx
+│   │   ├── PulseFlowEmbed.tsx
+│   │   ├── client.ts
+│   │   └── types.ts
+│   ├── public/config.js
+│   ├── package.json
+│   ├── tsconfig.json
+│   └── README.md
 ├── internal/
-│   ├── adapter/
-│   │   ├── api/                # HTTP layer (Fiber)
-│   │   │   ├── handler.go      # Route handlers (ingest, query, admin, ws)
-│   │   │   ├── middleware.go   # RequestID, Logger, Recover, RateLimiter
-│   │   │   ├── auth.go         # API key auth + per-tenant rate limiting
-│   │   │   ├── admin.go        # DLQ, replay, circuit breaker endpoints
-│   │   │   ├── websocket.go    # WebSocket broadcaster + metrics streaming
-│   │   │   └── middleware/
-│   │   │       └── tracing.go  # OpenTelemetry distributed tracing middleware
-│   │   ├── postgres/           # Persistence (pgx v5, embedded migrations)
-│   │   │   ├── event.go        # EventRepository + partition management
-│   │   │   ├── dlq.go          # DLQRepository methods
-│   │   │   ├── tenant.go       # TenantRepository (multi-tenant)
-│   │   │   ├── destination.go  # DestinationRepository (webhook targets)
-│   │   │   └── migrations/
-│   │   ├── redis/              # Streaming (XADD, XREADGROUP, XCLAIM, DLQ)
-│   │   │   ├── stream.go       # Stream adapter + DLQ management
-│   │   │   ├── concurrency.go  # Redis-backed concurrency limiter (Lua script)
-│   │   │   ├── circuitbreaker.go  # sony/gobreaker wrapper
-│   │   │   └── circuitbreaker_state.go  # State adapter for admin queries
-│   │   ├── tracing/            # OpenTelemetry provider + propagator
-│   │   │   ├── tracing.go      # InitTracer + OTLP HTTP/gRPC exporter
-│   │   │   └── propagator.go   # W3C TraceContext HTTP/Redis propagation
-│   │   ├── filter/             # CEL payload filtering
-│   │   │   └── cel.go          # RuleEngine with compiled-program cache
-│   │   └── webhook/            # Signed webhook delivery
-│   │       └── sender.go       # Dual-secret HMAC-SHA256, 410 auto-disable, backoff
-│   ├── config/                 # Viper-based loader
-│   ├── entity/                 # Domain (zero deps)
-│   │   ├── event.go            # Event entity, validation
-│   │   ├── dlq.go              # DLQMessage entity, DLQFilter
-│   │   ├── tenant.go           # Tenant, APIKey entities
-│   │   ├── destination.go      # Destination entity (dual-secret, CEL, concurrency)
-│   │   ├── destination_repository.go  # Ports for destinations, webhooks, CEL, concurrency
-│   │   ├── tracing.go          # Propagator interface, Tracer alias, trace keys
-│   │   ├── errors.go           # Domain error sentinels
-│   │   └── repository.go       # EventRepository, EventStream ports
-│   └── usecase/                # Application layer
-│       ├── ingest.go
-│       ├── process.go          # Consumer workers + webhook delivery + tracing
-│       ├── query.go
-│       ├── dlq.go              # DLQ management use case
-│       ├── replay.go           # Time-travel replay engine
-│       ├── webhook.go          # Webhook deliverer interface
-│       ├── metrics.go          # Prometheus metric wrappers
-│       └── errors.go           # Usecase error sentinels
+|│   ├── adapter/
+|│   │   ├── api/                # HTTP layer (Fiber)
+|│   │   │   ├── handler.go      # Route handlers (ingest, query, admin, ws)
+|│   │   │   ├── middleware.go   # RequestID, Logger, Recover, RateLimiter
+|│   │   │   ├── auth.go         # API key auth + per-tenant rate limiting
+|│   │   │   ├── admin.go        # DLQ, replay, circuit breaker endpoints
+|│   │   │   ├── websocket.go    # WebSocket broadcaster + metrics streaming
+|│   │   │   └── middleware/
+|│   │   │       └── tracing.go  # OpenTelemetry distributed tracing middleware
+|│   │   ├── postgres/           # Persistence (pgx v5, embedded migrations)
+|│   │   │   ├── event.go        # EventRepository + partition management
+|│   │   │   ├── dlq.go          # DLQRepository methods
+|│   │   │   ├── tenant.go       # TenantRepository (multi-tenant)
+|│   │   │   ├── destination.go  # DestinationRepository (webhook targets)
+|│   │   │   ├── monitor.go      # MonitorRepository (dead man's switch)
+|│   │   │   └── migrations/
+|│   │   ├── redis/              # Streaming (XADD, XREADGROUP, XCLAIM, DLQ)
+|│   │   │   ├── stream.go       # Stream adapter + DLQ management
+|│   │   │   ├── concurrency.go  # Redis-backed concurrency limiter (Lua script)
+| │   │   │   ├── dedup.go       # Ingress deduplication (SETNX with TTL)
+| │   │   │   ├── batcher.go     # Event batching (ZADD/ZRANGE + Lua flush)
+| │   │   │   ├── circuitbreaker.go  # sony/gobreaker wrapper
+| │   │   │   └── circuitbreaker_state.go  # State adapter for admin queries
+| │   ├── schema/               # JSON Schema validation (jsonschema/v5)
+| │   │   └── validator.go      # SchemaValidator implementation
+| │   ├── tracing/            # OpenTelemetry provider + propagator
+| │   │   ├── tracing.go      # InitTracer + OTLP HTTP/gRPC exporter
+| │   │   └── propagator.go   # W3C TraceContext HTTP/Redis propagation
+| │   ├── filter/             # CEL payload filtering
+| │   │   └── cel.go          # RuleEngine with compiled-program cache
+| │   └── webhook/            # Signed webhook delivery
+| │       └── sender.go       # Dual-secret HMAC-SHA256, 410 auto-disable, backoff
+| │   ├── config/                 # Viper-based loader
+| │   ├── entity/                 # Domain (zero deps)
+| │   │   ├── event.go            # Event entity, validation
+| │   │   ├── dlq.go              # DLQMessage entity, DLQFilter
+| │   │   ├── tenant.go           # Tenant, APIKey entities
+| │   │   ├── destination.go      # Destination entity (dual-secret, CEL, concurrency)
+| │   │   ├── batching.go         # BatchingRule, SchemaDefinition entities + interfaces
+| │   │   ├── dedup.go            # DedupKey, DeduplicationConfig, Deduplicator interface
+| │   │   ├── monitor.go          # HeartbeatExpectation, AlertPayload, monitor interfaces
+| │   │   ├── destination_repository.go  # Ports for destinations, webhooks, CEL, concurrency
+| │   │   ├── tracing.go          # Propagator interface, Tracer alias, trace keys
+| │   │   ├── errors.go           # Domain error sentinels
+| │   │   └── repository.go       # EventRepository, EventStream ports
+| │   └── usecase/                # Application layer
+| │       ├── ingest.go
+| │       ├── process.go          # Consumer workers + webhook delivery + tracing
+| │       ├── query.go
+| │       ├── dlq.go              # DLQ management use case
+| │       ├── replay.go           # Time-travel replay engine
+| │       ├── webhook.go          # Webhook deliverer interface
+| │       ├── aggregator.go       # BatchAggregator (in-process batching)
+| │       ├── monitor.go          # Dead man's switch monitor worker
+| │       ├── metrics.go          # Prometheus metric wrappers
+| │       └── errors.go           # Usecase error sentinels
 ├── go.mod
 └── README.md
 ```
