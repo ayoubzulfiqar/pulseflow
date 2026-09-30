@@ -27,10 +27,13 @@ type Config struct {
 	Logging    LoggingConfig    `mapstructure:"logging"`
 	Metrics    MetricsConfig    `mapstructure:"metrics"`
 	Tracing    TracingConfig    `mapstructure:"tracing"`
-	Transformation TransformationConfig `mapstructure:"transformation"`
-	Compliance   ComplianceConfig   `mapstructure:"compliance"`
-	Embed       EmbedConfig      `mapstructure:"embed"`
-	Admin      AdminConfig      `mapstructure:"admin"`
+	Transformation   TransformationConfig   `mapstructure:"transformation"`
+	SchemaValidation SchemaValidationConfig `mapstructure:"schema_validation"`
+	Deduplication    DeduplicationConfig    `mapstructure:"deduplication"`
+	Compliance       ComplianceConfig       `mapstructure:"compliance"`
+	Monitor          MonitorConfig          `mapstructure:"monitor"`
+	Embed            EmbedConfig            `mapstructure:"embed"`
+	Admin            AdminConfig            `mapstructure:"admin"`
 }
 
 type AppConfig struct {
@@ -132,9 +135,19 @@ type TracingConfig struct {
 }
 
 type TransformationConfig struct {
-	Enabled  bool              `mapstructure:"enabled"`
-	Timeout  time.Duration     `mapstructure:"timeout"`
-	DefaultScript string       `mapstructure:"default_script"`
+	Enabled       bool              `mapstructure:"enabled"`
+	Timeout       time.Duration     `mapstructure:"timeout"`
+	DefaultScript string            `mapstructure:"default_script"`
+}
+
+type SchemaValidationConfig struct {
+	Enabled     bool     `mapstructure:"enabled"`
+	DLQOnFailure bool    `mapstructure:"dlq_on_failure"`
+}
+
+type DeduplicationConfig struct {
+	Enabled bool          `mapstructure:"enabled"`
+	Window  time.Duration `mapstructure:"window"`
 }
 
 type ComplianceConfig struct {
@@ -143,6 +156,11 @@ type ComplianceConfig struct {
 	AuditSecret    string         `mapstructure:"audit_secret"`
 	RedactDLQ      bool           `mapstructure:"redact_dlq"`
 	RedactLogs     bool           `mapstructure:"redact_logs"`
+}
+
+type MonitorConfig struct {
+	Enabled       bool          `mapstructure:"enabled"`
+	CheckInterval time.Duration `mapstructure:"check_interval"`
 }
 
 type EmbedConfig struct {
@@ -228,8 +246,14 @@ func LoadConfig(configPath string) (*Config, error) {
 	v.SetDefault("tracing.sample_rate", 1.0)
 	v.SetDefault("transformation.enabled", false)
 	v.SetDefault("transformation.timeout", 500*time.Millisecond)
+	v.SetDefault("schema_validation.enabled", false)
+	v.SetDefault("schema_validation.dlq_on_failure", true)
+	v.SetDefault("deduplication.enabled", false)
+	v.SetDefault("deduplication.window", 1*time.Hour)
 	v.SetDefault("compliance.pii_enabled", false)
 	v.SetDefault("compliance.audit_enabled", false)
+	v.SetDefault("monitor.enabled", false)
+	v.SetDefault("monitor.check_interval", 5*time.Minute)
 	v.SetDefault("embed.enabled", false)
 	v.SetDefault("embed.token_secret", "")
 	v.SetDefault("embed.token_ttl", 24*time.Hour)

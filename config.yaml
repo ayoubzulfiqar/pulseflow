@@ -87,12 +87,24 @@ transformation:
   enabled: false
   timeout: 500ms
 
+schema_validation:
+  enabled: false
+  dlq_on_failure: true
+
+deduplication:
+  enabled: false
+  window: 1h
+
 compliance:
   pii_enabled: false
   audit_enabled: false
   audit_secret: ""
   redact_dlq: true
   redact_logs: true
+
+monitor:
+  enabled: false
+  check_interval: 5m
 
 embed:
   enabled: false
