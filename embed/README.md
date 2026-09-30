@@ -70,7 +70,7 @@ function MyApp() {
 
 ## API Endpoints
 
-All endpoints are under `/v1/embed/` and require a valid embed token.
+All endpoints are under `/v1/embed/` and require a valid embed token, except `/v1/embed/token` which generates the token (requires admin API key).
 
 | Method | Path | Description |
 |--------|------|-------------|
