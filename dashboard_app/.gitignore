@@ -1,9 +1,0 @@
-.dart_tool/
-.build/
-build/
-.dart_tool/
-*.iml
-.idea/
-.vscode/
-.DS_Store
-pubspec.lock
