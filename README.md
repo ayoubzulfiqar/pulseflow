@@ -1017,3 +1017,10 @@ curl http://localhost:8080/metrics
 ## License
 
 Proprietary — developed by Ayoub Zulfiqar.
+
+## Community
+
+- [Contributing Guidelines](CONTRIBUTING.md)
+- [Code of Conduct](CODE_OF_CONDUCT.md)
+- [Security Policy](SECURITY.md)
+- [Report a Bug](https://github.com/ayoubzulfiqar/pulseflow/issues/new?template=bug_report.md)

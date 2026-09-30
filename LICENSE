@@ -1,0 +1,61 @@
+Business Source License 1.1
+
+Developer: Ayoub Zulfiqar
+Copyright (c) 2024 Ayoub Zulfiqar
+
+Source Location: https://github.com/ayoubzulfiqar/pulseflow
+
+This file is part of PulseFlow, a real-time event-driven webhook pipeline
+developed by Ayoub Zulfiqar ("Licensed Work").
+
+Licensed under the Business Source License 1.1 (the "License"); you may
+not use this file except in compliance with the License. You may obtain
+a copy of the License at
+
+  https://github.com/ayoubzulfiqar/pulseflow/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied, including
+without limitation the warranties of TITLE, NON-INFRINGEMENT, MERCHANTABILITY,
+or FITNESS FOR A PARTICULAR PURPOSE. See the License for the specific
+language governing permissions and limitations under the License.
+
+---
+
+Notice of Change to a Different License
+
+For the avoidance of doubt, the "Licensed Work" defined above includes
+any file (source or binary) that is part of the PulseFlow codebase.
+
+On the three-year anniversary of the initial public commit of PulseFlow
+on or about September 28, 2024, the Licensed Work will be re-licensed
+under the Server Side Public License, Version 1 (SSPL) or a compatible
+open-source license at the sole discretion of the copyright holder.
+
+---
+
+Additional Terms
+
+1. Usage: The Licensed Work may be used for any purpose, including
+   Commercial Purpose, but the Licensed Work may not be copied, modified,
+   distributed, or sublicensed for use in Production or delivered to third
+   parties as a service (SaaS) without a separate commercial license
+   agreement with Ayoub Zulfiqar (contact@ayoubzulfiqar.com).
+
+2. Non-compete: During the Change Period (three years from the Initial
+   Commit Date), you may not use the Licensed Work in any project that
+   directly competes with PulseFlow as a hosted webhook delivery service.
+
+3. Redistribution of source: You may copy and modify the Licensed Work
+   for non-commercial purposes, provided you retain this notice and all
+   copyright notices.
+
+4. Attribution: All copies or substantial portions of the Licensed Work
+   must retain the above copyright notice and attribution to Ayoub Zulfiqar.
+
+---
+
+Initial Commit Date: 2024-09-28
+Change Period: 3 years
+Change License: GNU Affero General Public License v3 or later (AGPL-3.0-or-later)
