@@ -65,6 +65,7 @@ type ProcessUseCase struct {
 	// Optional: payload transformation and compliance redaction.
 	transformer entity.Transformer
 	redactor    entity.Redactor
+	batcher     entity.Batcher
 	auditRepo   entity.AuditRepository
 	auditSecret string
 }
@@ -356,6 +357,18 @@ func (uc *ProcessUseCase) deliverWebhooks(ctx context.Context, event *entity.Eve
 			continue
 		}
 
+		// If batching is configured, enqueue to the batcher instead of
+		// direct delivery. The batcher releases the batch when MaxBatchSize
+		// is reached or MaxWaitDuration elapses.
+		if dest.BatchingRule != nil && dest.BatchingRule.Enabled && uc.batcher != nil {
+			if err := uc.batcher.Enqueue(ctx, dest.ID, deliveryEvent, dest.BatchingRule); err != nil {
+				uc.logger.Error("process: batch enqueue failed",
+					"dest_id", dest.ID, "error", err, "event_id", event.ID)
+				uc.recordAudit(dest.ID, event.ID, "failed", 0, err.Error(), redacted)
+			}
+			continue
+		}
+
 		// Evaluate CEL filter if configured (Phase 3).
 		if dest.CELFilter != "" {
 			if uc.filterer == nil {
@@ -453,6 +466,14 @@ func (uc *ProcessUseCase) WithAuditTrail(repo entity.AuditRepository) *ProcessUs
 // WithAuditSecret sets the HMAC secret used for signing audit records.
 func (uc *ProcessUseCase) WithAuditSecret(secret string) *ProcessUseCase {
 	uc.auditSecret = secret
+	return uc
+}
+
+// WithBatcher enables event batching and aggregation. When a destination
+// has a BatchingRule configured, events are held in the batcher buffer
+// and released as a single JSON array payload.
+func (uc *ProcessUseCase) WithBatcher(b entity.Batcher) *ProcessUseCase {
+	uc.batcher = b
 	return uc
 }
 

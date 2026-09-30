@@ -17,6 +17,11 @@ type IngestUseCase struct {
 	webhook *WebhookSender
 	logger  *slog.Logger
 	metrics *Metrics
+
+	// Optional: schema validation and ingress deduplication.
+	schemaValidator entity.SchemaValidator
+	deduplicator    entity.Deduplicator
+	dedupWindow     time.Duration
 }
 
 // NewIngestUseCase creates an IngestUseCase. The webhook sender may be nil
@@ -65,6 +70,47 @@ func (uc *IngestUseCase) Ingest(ctx context.Context, event *entity.Event) (*enti
 		return nil, fmt.Errorf("%w: %v", ErrInvalidEvent, err)
 	}
 
+	// --- Ingress Deduplication (exactly-once wedge) ---
+	// The idempotency key can be passed via event metadata
+	// (set by the HTTP handler from the Idempotency-Key header)
+	// or derived from the event's content hash.
+	idempotencyKey := event.Metadata["idempotency_key"]
+	if uc.deduplicator != nil {
+		key, err := uc.deduplicator.GenerateKey(event, idempotencyKey)
+		if err == nil {
+			isDuplicate, err := uc.deduplicator.CheckAndMark(ctx, key, uc.dedupWindow)
+			if err == nil && isDuplicate {
+				// Silently return success — the sender's retry is satisfied.
+				uc.logger.Debug("event deduplicated (duplicate within window)",
+					"event_id", event.ID, "source", event.Source, "type", event.Type)
+				return event, nil
+			}
+		}
+	}
+
+	// --- Schema Validation (contract testing wedge) ---
+	if uc.schemaValidator != nil {
+		result := uc.validateSchema(ctx, event)
+		if !result.Valid {
+			// Route to schema-violation DLQ.
+			uc.logger.Warn("event failed schema validation",
+				"event_id", event.ID, "errors", result.Errors)
+			if uc.repo != nil {
+				dlqMsg := &entity.DLQMessage{
+					ID:      string(event.ID),
+					Event:   event,
+					Reason:  entity.SchemaViolationDLQReason,
+					Status:  entity.DLQStatusPending,
+					FailedAt: time.Now().UTC(),
+				}
+				_ = uc.repo.StoreDLQ(ctx, dlqMsg)
+			}
+			// Return success so the sender isn't penalized — they
+			// receive a 200 but the event goes to the DLQ.
+			return event, nil
+		}
+	}
+
 	// Enrich metadata with ingestion context (only if caller-provided data absent).
 	ingestMeta := map[string]string{
 		"ingested_at": time.Now().UTC().Format(time.RFC3339Nano),
@@ -106,4 +152,43 @@ func (uc *IngestUseCase) Ingest(ctx context.Context, event *entity.Event) (*enti
 		"duration_ms", time.Since(start).Milliseconds())
 
 	return event, nil
+}
+
+// WithSchemaValidator enables JSON schema validation before persistence.
+// Events that fail validation are sent to the DLQ with SchemaViolationDLQReason.
+func (uc *IngestUseCase) WithSchemaValidator(sv entity.SchemaValidator) *IngestUseCase {
+	uc.schemaValidator = sv
+	return uc
+}
+
+// WithDeduplicator enables ingress-level deduplication using a Redis cache.
+// Duplicate events (same content hash) within the window are silently dropped
+// but still return 200 OK to the caller.
+func (uc *IngestUseCase) WithDeduplicator(d entity.Deduplicator, window time.Duration) *IngestUseCase {
+	uc.deduplicator = d
+	uc.dedupWindow = window
+	return uc
+}
+
+// checkDedup performs an atomic check-and-mark against the deduplication cache.
+// Returns true if the event is a duplicate (should be dropped).
+func (uc *IngestUseCase) checkDedup(ctx context.Context, event *entity.Event, idempotencyKey string) bool {
+	if uc.deduplicator == nil {
+		return false
+	}
+	key, err := uc.deduplicator.GenerateKey(event, idempotencyKey)
+	if err != nil {
+		return false
+	}
+	duplicate, _ := uc.deduplicator.CheckAndMark(ctx, key, uc.dedupWindow)
+	return duplicate
+}
+
+// validateSchema checks the event against registered JSON schemas.
+// Returns nil if validation passes, or an error describing the failures.
+func (uc *IngestUseCase) validateSchema(ctx context.Context, event *entity.Event) *entity.SchemaValidationResult {
+	if uc.schemaValidator == nil {
+		return &entity.SchemaValidationResult{Valid: true}
+	}
+	return uc.schemaValidator.Validate(ctx, event)
 }

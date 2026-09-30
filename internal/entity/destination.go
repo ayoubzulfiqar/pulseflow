@@ -41,6 +41,16 @@ type Destination struct {
 	// before delivery. If empty, all matching events are delivered.
 	CELFilter string `json:"cel_filter"`
 
+	// BatchingRule configures event aggregation before delivery.
+	// When enabled, matching events are held in a buffer and released
+	// as a single JSON array payload.
+	BatchingRule *BatchingRule `json:"batching_rule,omitempty"`
+
+	// SchemaPattern is an optional JSON Schema pattern name for this
+	// destination. Used for contract testing — if the event payload
+	// doesn't match the expected schema, it goes to a schema-violation DLQ.
+	SchemaPattern string `json:"schema_pattern,omitempty"`
+
 	// RateLimitRPS is the per-destination outbound rate limit.
 	RateLimitRPS float64 `json:"rate_limit_rps"`
 
