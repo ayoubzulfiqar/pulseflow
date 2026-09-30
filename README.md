@@ -7,21 +7,22 @@ Production-grade event ingestion, processing, and delivery platform. Built for h
 PulseFlow is an event-driven pipeline that ingests domain events via HTTP, persists them durably, publishes them to a Redis Streams consumer-group topology for asynchronous processing, and delivers signed webhook notifications to downstream systems. Designed for horizontal scaling, zero-downtime deploys, and graceful degradation under partial infrastructure failure.
 
 **Key differentiators:**
-- Events are saved to PostgreSQL and published to Redis Streams before responding — no data loss if the stream is slow
-- Dead workers' messages are automatically reclaimed by other consumers via XCLAIM
-- Failed messages go to a dead-letter queue (DLQ) with configurable retries (default: 5)
-- Replay historical events from PostgreSQL within any time window
-- Webhook payloads are signed with HMAC-SHA256 and include a timestamp to prevent replay attacks
-- Rotate webhook signing keys without downtime using dual-secret mode
-- Filter which events each destination receives using CEL expressions (Common Expression Language)
-- Each destination has a configurable concurrency limit. Redis-backed semaphores prevent overwhelming downstream services
-- If a destination returns HTTP 410 Gone, it is automatically disabled in PostgreSQL
-- Circuit breaker protects against Redis failures
-- Each tenant gets its own API keys, rate limits, and audit trail
-- PostgreSQL partitions event data by month for fast reads and easy cleanup
-- OpenTelemetry tracing shows the full path of every event across HTTP and Redis Streams
-- Prometheus metrics, JSON logs, and a real-time WebSocket metrics stream
-- API for managing DLQ, replaying events, and resetting circuit breakers
+|- Events are saved to PostgreSQL and published to Redis Streams before responding — no data loss if the stream is slow
+|- Dead workers' messages are automatically reclaimed by other consumers via XCLAIM
+|- Failed messages go to a dead-letter queue (DLQ) with configurable retries (default: 5)
+|- Replay historical events from PostgreSQL within any time window
+|- Webhook payloads are signed with HMAC-SHA256 and include a timestamp to prevent replay attacks
+|- Rotate webhook signing keys without downtime using dual-secret mode
+|- Filter which events each destination receives using CEL expressions (Common Expression Language)
+|- Each destination has a configurable concurrency limit. Redis-backed semaphores prevent overwhelming downstream services
+|- If a destination returns HTTP 410 Gone, it is automatically disabled in PostgreSQL
+|- Circuit breaker protects against Redis failures
+|- Each tenant gets its own API keys, rate limits, and audit trail
+|- PostgreSQL partitions event data by month for fast reads and easy cleanup
+|- OpenTelemetry tracing shows the full path of every event across HTTP and Redis Streams
+|- Prometheus metrics, JSON logs, and a real-time WebSocket metrics stream
+|- API for managing DLQ, replaying events, and resetting circuit breakers
+|- **White-Label Embed**: iframe-ready React component for SaaS platforms to embed webhook management
 
 ## Control Plane API
 
@@ -455,11 +456,16 @@ Configuration is loaded from `config.yaml` (in CWD or `/etc/pulseflow/config.yam
 | | `tracing.exporter` | `otlphttp` | Exporter type: `otlphttp` or `otlpgrpc` |
 | | `tracing.endpoint` | `localhost:4318` | OTLP collector endpoint |
 | | `tracing.sample_rate` | `1.0` | Trace sampling ratio |
-| **Webhooks** | `webhooks.enabled` | `false` | Enable webhook delivery |
-| | `webhooks.timeout` | `30s` | Default HTTP timeout per delivery |
-| | `webhooks.max_retries` | `3` | Max retry attempts before DLQ |
-| | `webhooks.retry_delay` | `5s` | Base retry backoff interval |
-| | `webhooks.endpoints` | `[]` | List of webhook endpoint configs |
+| **Transformation** | `transformation.enabled` | `false` | Enable JS payload transformation |
+| | `transformation.timeout` | `500ms` | Script execution timeout |
+| **Compliance** | `compliance.pii_enabled` | `false` | Enable PII/PHI redaction |
+| | `compliance.audit_enabled` | `false` | Enable signed audit trail |
+| | `compliance.audit_secret` | *(empty)* | HMAC secret for audit signing |
+| | `compliance.redact_dlq` | `true` | Redact PII before DLQ write |
+| | `compliance.redact_logs` | `true` | Redact PII in logs |
+| **Embed** | `embed.enabled` | `false` | Enable white-label embed API |
+| | `embed.token_secret` | *(empty)* | HMAC secret for embed tokens |
+| | `embed.token_ttl` | `24h` | Embed token expiry |
 
 ### Environment Variables
 
@@ -474,6 +480,10 @@ PULSEFLOW_WEBHOOKS_ENABLED=true
 PULSEFLOW_TRACING_ENABLED=true
 PULSEFLOW_TRACING_EXPORTER=otlphttp
 PULSEFLOW_TRACING_ENDPOINT=localhost:4318
+PULSEFLOW_COMPLIANCE_PII_ENABLED=true
+PULSEFLOW_COMPLIANCE_AUDIT_ENABLED=true
+PULSEFLOW_TRANSFORMATION_ENABLED=true
+PULSEFLOW_EMBED_ENABLED=true
 ```
 
 ## API
@@ -557,33 +567,15 @@ Prometheus metrics endpoint.
 
 ## Web Dashboard
 
-The PulseFlow dashboard is a Flutter-based admin interface (Web / Desktop / Mobile) providing a visual control plane for operators.
+The PulseFlow dashboard has been replaced by the **Embeddable White-Label Component** — an iframe-ready React package (`@pulseflow/embed`) that B2B SaaS platforms can embed directly in their own applications. See the [embed README](embed/README.md) for integration and usage details.
 
-### Screens
-
-| Screen | Description |
-|--------|-------------|
-| **Live Stream Monitor** | Real-time graphs of ingestion RPS, processing RPS, DLQ count, failure rate, active consumers, and circuit breaker state via WebSocket. |
-| **DLQ Operator** | List dead-lettered messages with filters, bulk retry, purge, and per-message detail view. |
-| **Payload Inspector** | Search historical events by type/source/subject, inspect JSON payloads and headers, and trigger time-travel replay of individual events. |
-| **Circuit Breaker Panel** | View live breaker state and 1-click manual reset with reset history log. |
-
-### Build & Run
-
-```bash
-cd dashboard_app
-flutter pub get
-flutter run -d chrome  # Web
-flutter run -d macos   # Desktop
-# Mobile: flutter run
-```
-
-Configure the dashboard to connect to the API:
-
-```bash
-flutter run -d chrome \
-  --dart-define=PULSEFLOW_API_URL=http://localhost:8080 \
-  --dart-define=PULSEFLOW_API_KEY=pk_live_xxx
+### Features
+- **Delivery Logs**: view recent webhook delivery attempts (delivered, failed, filtered)
+- **Endpoint Management**: list webhook destinations, view their configuration
+- **Retry Controls**: one-click retry for failed deliveries (if not read-only)
+- **Tenant Scoping**: all data is automatically filtered to the caller's tenant ID
+- **Branding**: fully customizable colors, logo, font, and corner radius
+- **Read-Only Mode**: disable all write operations when needed
 ```
 
 ## Security
@@ -704,6 +696,109 @@ Available variables in CEL expressions:
 event.type == 'order.created' && event.data.amount > 100
 event.source == 'billing-service' && event.data.status == 'succeeded'
 event.metadata['priority'] == 'high' || event.data.amount > 1000
+```
+
+## Enterprise Features
+
+PulseFlow provides three enterprise-grade capability wedges that can be enabled independently in configuration:
+
+### 1. Embedded White-Label Component
+
+B2B SaaS companies (CRMs, HR tools, etc.) can embed webhook management directly into their application using an iframe-ready React package. End-users manage their own webhook endpoints, view delivery logs, and retry failures — all scoped to the parent SaaS's tenant ID.
+
+**Installation:**
+```bash
+npm install @pulseflow/embed
+```
+
+**React usage:**
+```tsx
+import { PulseFlowEmbed } from "@pulseflow/embed";
+
+<PulseFlowEmbed config={{
+  apiUrl: "https://api.yourapp.com",
+  tenantId: "tenant_abc123",
+  hideBranding: true,
+  readOnly: false,
+  theme: { primaryColor: "#3b82f6", logoUrl: "https://yourapp.com/logo.png" },
+}} />
+```
+
+**iframe usage:**
+```html
+<iframe
+  src="https://app.pulseflow.io/embed?tenant_id=tenant_abc123"
+  width="100%" height="600" frameborder="0"
+/>
+```
+
+**Configuration:**
+```yaml
+embed:
+  enabled: true
+  token_secret: "your-hmac-signing-secret"
+  token_ttl: 24h
+```
+
+API endpoints: `/v1/embed/token`, `/v1/embed/destinations`, `/v1/embed/deliveries`, `/v1/embed/events`, `/v1/embed/deliveries/:id/retry`.
+
+### 2. AI Agent Event Router
+
+Transforms messy, unstructured AI/LLM event output into clean, schema-validated payloads before delivery. Developers write a 5-line JavaScript snippet in the dashboard — no code deploys needed.
+
+**How it works:**
+1. AI agent produces an event with raw LLM output
+2. A JavaScript transformation script maps the output to the destination's expected schema
+3. The transformed payload is validated against a JSON schema
+4. Only validated payloads are delivered to webhook destinations
+
+**Enable in config:**
+```yaml
+transformation:
+  enabled: true
+  timeout: 500ms
+```
+
+**Example transformation script:**
+```javascript
+var match = event.data.llm_output.match(/Customer: (.+?), Amount: \$([\d,.]+)/);
+return {
+  customer: match[1].trim(),
+  amount: parseFloat(match[2].replace(/,/g, "")),
+  source: "ai_agent"
+};
+```
+
+Scripts run in a sandboxed JS VM (otto) with execution timeouts and dangerous globals stripped.
+
+### 3. Compliance-First Pipeline
+
+For healthtech, fintech, and EU-based teams that need SOC 2/HIPAA-ready event delivery with immutable audit proof.
+
+**PII/PHI Redaction:**
+Automatically redacts SSNs, emails, credit card numbers, phone numbers, and API keys from event data and metadata using regex patterns before anything is written to PostgreSQL (DLQ), logs, or delivered to webhooks.
+
+```yaml
+compliance:
+  pii_enabled: true
+  redact_dlq: true
+  redact_logs: true
+```
+
+Default patterns: SSN, email, credit card, phone, API keys. Custom patterns can be added to the `pii_patterns` array.
+
+**Immutable Audit Trail:**
+Every delivery attempt (delivered, failed, filtered, skipped) is recorded with an HMAC-SHA256 signature, creating cryptographically verifiable proof of what was sent and when.
+
+```yaml
+compliance:
+  audit_enabled: true
+  audit_secret: "your-hmac-signing-secret"
+```
+
+Audit records are stored in the `audit_records` table with indexes on `event_id`, `destination_id`, `status`, and `timestamp`. Query via:
+```
+GET /v1/embed/deliveries?event_id=evt_123&status=delivered
 ```
 
 ### Limiting Concurrent Requests Per Destination
