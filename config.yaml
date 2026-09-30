@@ -82,3 +82,19 @@ tracing:
   exporter: "otlphttp"
   endpoint: "localhost:4318"
   sample_rate: 1.0
+
+transformation:
+  enabled: false
+  timeout: 500ms
+
+compliance:
+  pii_enabled: false
+  audit_enabled: false
+  audit_secret: ""
+  redact_dlq: true
+  redact_logs: true
+
+embed:
+  enabled: false
+  token_secret: ""
+  token_ttl: 24h

@@ -27,6 +27,9 @@ type Config struct {
 	Logging    LoggingConfig    `mapstructure:"logging"`
 	Metrics    MetricsConfig    `mapstructure:"metrics"`
 	Tracing    TracingConfig    `mapstructure:"tracing"`
+	Transformation TransformationConfig `mapstructure:"transformation"`
+	Compliance   ComplianceConfig   `mapstructure:"compliance"`
+	Embed       EmbedConfig      `mapstructure:"embed"`
 	Admin      AdminConfig      `mapstructure:"admin"`
 }
 
@@ -128,6 +131,26 @@ type TracingConfig struct {
 	SampleRate   float64 `mapstructure:"sample_rate"`
 }
 
+type TransformationConfig struct {
+	Enabled  bool              `mapstructure:"enabled"`
+	Timeout  time.Duration     `mapstructure:"timeout"`
+	DefaultScript string       `mapstructure:"default_script"`
+}
+
+type ComplianceConfig struct {
+	PIIEnabled     bool           `mapstructure:"pii_enabled"`
+	AuditEnabled   bool           `mapstructure:"audit_enabled"`
+	AuditSecret    string         `mapstructure:"audit_secret"`
+	RedactDLQ      bool           `mapstructure:"redact_dlq"`
+	RedactLogs     bool           `mapstructure:"redact_logs"`
+}
+
+type EmbedConfig struct {
+	Enabled     bool          `mapstructure:"enabled"`
+	TokenSecret string        `mapstructure:"token_secret"`
+	TokenTTL    time.Duration `mapstructure:"token_ttl"`
+}
+
 // AdminConfig controls the admin control plane.
 type AdminConfig struct {
 	AuthRequired bool `mapstructure:"auth_required"`
@@ -203,6 +226,13 @@ func LoadConfig(configPath string) (*Config, error) {
 	v.SetDefault("tracing.exporter", "otlphttp")
 	v.SetDefault("tracing.endpoint", "localhost:4318")
 	v.SetDefault("tracing.sample_rate", 1.0)
+	v.SetDefault("transformation.enabled", false)
+	v.SetDefault("transformation.timeout", 500*time.Millisecond)
+	v.SetDefault("compliance.pii_enabled", false)
+	v.SetDefault("compliance.audit_enabled", false)
+	v.SetDefault("embed.enabled", false)
+	v.SetDefault("embed.token_secret", "")
+	v.SetDefault("embed.token_ttl", 24*time.Hour)
 	v.SetDefault("admin.auth_required", false)
 	v.SetDefault("webhooks.enabled", false)
 	v.SetDefault("webhooks.timeout", 30*time.Second)

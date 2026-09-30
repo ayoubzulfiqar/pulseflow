@@ -12,10 +12,12 @@ import (
 	"time"
 
 	"github.com/ayoubzulfiqar/pulseflow/internal/adapter/api"
+	"github.com/ayoubzulfiqar/pulseflow/internal/adapter/compliance"
 	"github.com/ayoubzulfiqar/pulseflow/internal/adapter/filter"
 	"github.com/ayoubzulfiqar/pulseflow/internal/adapter/postgres"
 	"github.com/ayoubzulfiqar/pulseflow/internal/adapter/redis"
 	"github.com/ayoubzulfiqar/pulseflow/internal/adapter/tracing"
+	"github.com/ayoubzulfiqar/pulseflow/internal/adapter/transform"
 	"github.com/ayoubzulfiqar/pulseflow/internal/adapter/webhook"
 	"github.com/ayoubzulfiqar/pulseflow/internal/config"
 	"github.com/ayoubzulfiqar/pulseflow/internal/entity"
@@ -155,6 +157,34 @@ func run() error {
 	// --- CEL rule engine (Phase 3) ---
 	celFilterer := filter.NewRuleEngine()
 
+	// --- Payload transformer (AI Event Router wedge) ---
+	var transformer entity.Transformer
+	if cfg.Transformation.Enabled {
+		transformer = transform.NewJSTransformer(cfg.Transformation.Timeout)
+		logger.Info("transformation engine enabled", "timeout", cfg.Transformation.Timeout)
+	}
+
+	// --- PII/PHI redactor (Compliance wedge) ---
+	var redactor entity.Redactor
+	if cfg.Compliance.PIIEnabled {
+		redactor = compliance.NewPIIRedactor(compliance.DefaultPIIPatterns(), logger)
+		logger.Info("PII redaction enabled", "patterns", len(compliance.DefaultPIIPatterns()))
+	}
+
+	// --- Audit trail (Compliance wedge) ---
+	var auditRepo entity.AuditRepository
+	if cfg.Compliance.AuditEnabled && pgRepo != nil {
+		auditRepo = postgres.NewAuditRepository(pgRepo.Pool(), cfg.Compliance.AuditSecret, logger)
+		logger.Info("audit trail enabled")
+	}
+
+	// --- Embed handler (White-Label wedge) ---
+	var embedHandler *api.EmbedHandler
+	if cfg.Embed.Enabled && destRepo != nil {
+		embedHandler = api.NewEmbedHandler(destRepo, auditRepo, cfg.Embed.TokenSecret, cfg.Embed.TokenTTL)
+		logger.Info("embed handler enabled")
+	}
+
 	// --- Use cases ---
 	// Ingest no longer fires webhooks directly — delivery moves to ProcessUseCase.
 	// The webhook param is kept as nil to maintain backward compat.
@@ -202,6 +232,15 @@ func run() error {
 			destRepo, filt, deliv, tracerProvider,
 			logger, metrics,
 		)
+		if transformer != nil {
+			processUC = processUC.WithTransformer(transformer)
+		}
+		if redactor != nil {
+			processUC = processUC.WithRedactor(redactor)
+		}
+		if auditRepo != nil {
+			processUC = processUC.WithAuditTrail(auditRepo)
+		}
 	}
 
 	// --- Health checks ---
@@ -265,6 +304,11 @@ func run() error {
 	// --- Auth middleware ---
 	if cfg.Admin.AuthRequired && tenantRepo != nil {
 		server.App().Use(api.APIKeyAuth(tenantRepo, logger))
+	}
+
+	// --- Embed API routes (White-Label wedge) ---
+	if embedHandler != nil {
+		embedHandler.RegisterEmbedRoutes(server.App())
 	}
 
 	// --- Rate limiter ---
