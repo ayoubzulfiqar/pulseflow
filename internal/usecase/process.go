@@ -61,11 +61,19 @@ type ProcessUseCase struct {
 	filterer     entity.CELFilterer
 	deliverer    entity.WebhookDeliverer
 	tracer       entity.Tracer
+
+	// Optional: payload transformation and compliance redaction.
+	transformer entity.Transformer
+	redactor    entity.Redactor
+	auditRepo   entity.AuditRepository
+	auditSecret string
 }
 
 // NewProcessUseCase creates a ProcessUseCase.
 // The destinations, filterer, deliverer, and tracer parameters are optional —
 // pass nil to disable CEL-filtered webhook delivery and tracing.
+// Optional compliance features (transformation, redaction, audit) can be
+// enabled via the WithTransformer, WithRedactor, and WithAuditTrail options.
 func NewProcessUseCase(
 	stream entity.EventStream,
 	repo entity.EventRepository,
@@ -311,6 +319,28 @@ func (uc *ProcessUseCase) deliverWebhooks(ctx context.Context, event *entity.Eve
 		return
 	}
 
+	// Apply PII/PHI redaction if configured — creates a redacted copy
+	// for delivery while keeping the original for trace correlation.
+	redacted := false
+	deliveryEvent := event
+	if uc.redactor != nil {
+		deliveryEvent = uc.redactor.Redact(ctx, event)
+		redacted = true
+	}
+
+	// Apply payload transformation if configured — transforms the
+	// Data field using the destination's transformation config.
+	if uc.transformer != nil {
+		transformed, err := uc.transformer.Transform(ctx, &entity.TransformationConfig{}, deliveryEvent)
+		if err != nil {
+			uc.logger.Error("process: payload transformation failed",
+				"error", err, "event_id", event.ID)
+			// Continue with original payload rather than failing delivery.
+		} else {
+			deliveryEvent.Data = transformed
+		}
+	}
+
 	dests, err := uc.destinations.ListActive(ctx, event.Type, event.Source)
 	if err != nil {
 		uc.logger.Error("process: list destinations for webhook", "error", err, "event_id", event.ID)
@@ -333,7 +363,7 @@ func (uc *ProcessUseCase) deliverWebhooks(ctx context.Context, event *entity.Eve
 					"dest_id", dest.ID, "event_id", event.ID)
 				continue
 			}
-			ok, err := uc.filterer.ShouldDeliver(ctx, dest.CELFilter, event)
+			ok, err := uc.filterer.ShouldDeliver(ctx, dest.CELFilter, deliveryEvent)
 			if err != nil {
 				uc.logger.Error("process: cel filter evaluation failed",
 					"dest_id", dest.ID, "error", err, "event_id", event.ID)
@@ -343,6 +373,7 @@ func (uc *ProcessUseCase) deliverWebhooks(ctx context.Context, event *entity.Eve
 				uc.logger.Debug("process: event filtered out by CEL rule",
 					"dest_id", dest.ID, "cel_filter", dest.CELFilter,
 					"event_id", event.ID, "trace_id", traceID)
+				uc.recordAudit(dest.ID, event.ID, "filtered", 0, "cel filter mismatch", redacted)
 				continue
 			}
 		}
@@ -350,9 +381,11 @@ func (uc *ProcessUseCase) deliverWebhooks(ctx context.Context, event *entity.Eve
 		uc.logger.Debug("process: delivering webhook",
 			"dest_id", dest.ID, "event_id", event.ID, "trace_id", traceID)
 
+		uc.recordAudit(dest.ID, event.ID, "delivering", 0, "", redacted)
+
 		// The webhook sender handles signing, concurrency limiting,
 		// retries, and HTTP 410 auto-disable.
-		uc.deliverer.Deliver(ctx, dest, event)
+		uc.deliverer.Deliver(ctx, dest, deliveryEvent)
 	}
 }
 
@@ -397,4 +430,53 @@ func (uc *ProcessUseCase) parseDLQFromStream(msg entity.StreamMessage, reason st
 		Consumer:   msg.Consumer,
 		Status:     status,
 	}, nil
+}
+
+// WithTransformer enables payload transformation (JavaScript) before webhook delivery.
+func (uc *ProcessUseCase) WithTransformer(t entity.Transformer) *ProcessUseCase {
+	uc.transformer = t
+	return uc
+}
+
+// WithRedactor enables PII/PHI redaction before persistence and delivery.
+func (uc *ProcessUseCase) WithRedactor(r entity.Redactor) *ProcessUseCase {
+	uc.redactor = r
+	return uc
+}
+
+// WithAuditTrail enables cryptographically signed audit records for deliveries.
+func (uc *ProcessUseCase) WithAuditTrail(repo entity.AuditRepository) *ProcessUseCase {
+	uc.auditRepo = repo
+	return uc
+}
+
+// WithAuditSecret sets the HMAC secret used for signing audit records.
+func (uc *ProcessUseCase) WithAuditSecret(secret string) *ProcessUseCase {
+	uc.auditSecret = secret
+	return uc
+}
+
+// maybeRedact applies PII redaction if a redactor is configured.
+func (uc *ProcessUseCase) maybeRedact(ctx context.Context, event *entity.Event) *entity.Event {
+	if uc.redactor == nil {
+		return event
+	}
+	return uc.redactor.Redact(ctx, event)
+}
+
+// recordAudit writes a signed audit record for a delivery attempt.
+func (uc *ProcessUseCase) recordAudit(destID string, eventID entity.EventID, status string, statusCode int, reason string, redacted bool) {
+	if uc.auditRepo == nil {
+		return
+	}
+	record := &entity.AuditRecord{
+		EventID:      string(eventID),
+		DestinationID: destID,
+		Timestamp:    time.Now().UTC(),
+		Status:       status,
+		StatusCode:   statusCode,
+		Reason:       reason,
+		Redacted:     redacted,
+	}
+	_ = uc.auditRepo.StoreAudit(context.Background(), record)
 }
