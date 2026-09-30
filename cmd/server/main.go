@@ -16,6 +16,7 @@ import (
 	"github.com/ayoubzulfiqar/pulseflow/internal/adapter/filter"
 	"github.com/ayoubzulfiqar/pulseflow/internal/adapter/postgres"
 	"github.com/ayoubzulfiqar/pulseflow/internal/adapter/redis"
+	"github.com/ayoubzulfiqar/pulseflow/internal/adapter/schema"
 	"github.com/ayoubzulfiqar/pulseflow/internal/adapter/tracing"
 	"github.com/ayoubzulfiqar/pulseflow/internal/adapter/transform"
 	"github.com/ayoubzulfiqar/pulseflow/internal/adapter/webhook"
@@ -189,6 +190,23 @@ func run() error {
 	// Ingest no longer fires webhooks directly — delivery moves to ProcessUseCase.
 	// The webhook param is kept as nil to maintain backward compat.
 	ingestUC := usecase.NewIngestUseCase(stream, repo, nil, logger, metrics)
+
+	// --- Schema Validator (contract testing wedge) ---
+	var schemaValidator entity.SchemaValidator
+	if cfg.SchemaValidation.Enabled {
+		schemaValidator = schema.NewJSONSchemaValidator(logger)
+		ingestUC = ingestUC.WithSchemaValidator(schemaValidator)
+		logger.Info("schema validation enabled")
+	}
+
+	// --- Ingress Deduplication (exactly-once wedge) ---
+	var deduplicator entity.Deduplicator
+	if cfg.Deduplication.Enabled && redisClient != nil {
+		deduplicator = redis.NewDeduplicator(redisClient)
+		ingestUC = ingestUC.WithDeduplicator(deduplicator, cfg.Deduplication.Window)
+		logger.Info("ingress deduplication enabled", "window", cfg.Deduplication.Window)
+	}
+
 	queryUC := usecase.NewQueryUseCase(repo, logger)
 
 	var dlqUC *usecase.DLQUseCase
@@ -219,6 +237,13 @@ func run() error {
 			deliv = webhookSender
 		}
 
+		// --- Batch Aggregator (anti-spam wedge) ---
+		var batcher entity.Batcher
+		if webhookSender != nil {
+			batcher = usecase.NewBatchAggregator(webhookSender, 1*time.Second, logger)
+			logger.Info("batch aggregator enabled")
+		}
+
 		// Attach concurrency limiter to the webhook sender via propagator/tracer.
 		if concurrencyLimiter != nil && webhookSender != nil {
 			// Note: The concurrency limiter is wired inside the webhook sender's
@@ -240,6 +265,9 @@ func run() error {
 		}
 		if auditRepo != nil {
 			processUC = processUC.WithAuditTrail(auditRepo)
+		}
+		if batcher != nil {
+			processUC = processUC.WithBatcher(batcher)
 		}
 	}
 
@@ -297,6 +325,15 @@ func run() error {
 	}
 	if tracerProvider != nil {
 		serverOpts = append(serverOpts, api.WithTracer(tracerProvider))
+	}
+
+	// --- Dead Man's Switch Monitor ---.
+	var monitorUC *usecase.Monitor
+	if cfg.Monitor.Enabled && pgRepo != nil {
+		monitorRepo := postgres.NewMonitorRepository(pgRepo.Pool(), logger)
+		monitorUC = usecase.NewMonitor(monitorRepo, usecase.NewAlertSender(logger), cfg.Monitor.CheckInterval, logger)
+		monitorUC.Start()
+		logger.Info("dead man's switch monitor started", "check_interval", cfg.Monitor.CheckInterval)
 	}
 
 	server := api.NewServer(cfg, ingestUC, queryUC, logger, metrics, serverOpts...)
