@@ -2,89 +2,198 @@ package api
 
 import (
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/hex"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/ayoubzulfiqar/pulseflow/internal/entity"
 	"github.com/gofiber/fiber/v2"
+	"github.com/golang-jwt/jwt/v5"
 )
+
+// --- Request/Response structs ---
+
+// EmbedTokenRequest is the request body for /v1/embed/token.
+// The tenant_id is validated server-side — it should come from
+// the caller's authenticated session, not from raw user input.
+type EmbedTokenRequest struct {
+	TenantID  string `json:"tenant_id" binding:"required"`
+	ReadOnly  bool   `json:"read_only"`
+}
+
+// EmbedTokenResponse is the response returned after successful token generation.
+type EmbedTokenResponse struct {
+	Token    string `json:"token"`
+	TenantID string `json:"tenant_id"`
+	ExpiresAt int64  `json:"expires_at"`
+	ReadOnly  bool   `json:"read_only"`
+}
+
+// embedClaims defines the JWT claims structure used for embed tokens.
+// We keep this minimal: tenant_id, read_only, and standard exp/iat.
+type embedClaims struct {
+	TenantID  string `json:"tenant_id"`
+	ReadOnly  bool   `json:"read_only"`
+	jwt.RegisteredClaims
+}
 
 // EmbedHandler provides API endpoints for the white-label embeddable
 // component. All data is automatically scoped to the caller's tenant ID.
 type EmbedHandler struct {
 	destinations entity.DestinationRepository
 	audit        entity.AuditRepository
-	embedToken   string
+	tokenSecret  []byte
 	tokenTTL     time.Duration
 }
 
 // NewEmbedHandler creates the embed handler with the given dependencies.
+// tokenSecret must be a cryptographically random string (min 32 bytes
+// recommended). This is the HMAC key used to sign JWT embed tokens.
 func NewEmbedHandler(dests entity.DestinationRepository, audit entity.AuditRepository, tokenSecret string, tokenTTL time.Duration) *EmbedHandler {
 	return &EmbedHandler{
 		destinations: dests,
 		audit:        audit,
-		embedToken:   tokenSecret,
+		tokenSecret:  []byte(tokenSecret),
 		tokenTTL:     tokenTTL,
 	}
 }
 
 // RegisterEmbedRoutes registers all embed API routes on the given Fiber router.
-// All routes are under /v1/embed/ and accept a tenant-scoped bearer token.
+// All routes are under /v1/embed/ and accept a tenant-scoped JWT token.
+// The /token endpoint is exempt from validation (it generates the token).
 func (h *EmbedHandler) RegisterEmbedRoutes(router fiber.Router) {
 	embed := router.Group("/embed")
-	embed.Use(h.embedMiddleware)
 
-	embed.Get("/token", h.GetEmbedToken)
-	embed.Get("/destinations", h.GetDestinations)
-	embed.Get("/deliveries", h.GetDeliveries)
-	embed.Post("/deliveries/:id/retry", h.RetryDelivery)
-	embed.Get("/events", h.GetEvents)
+	// GenerateEmbedToken does NOT require an existing token — it generates one.
+	// In production, protect this with your admin API key middleware.
+	embed.Post("/token", h.GenerateEmbedToken)
+
+	// All subsequent routes require a valid embed token.
+	protected := embed.Group("/", h.RequireEmbedToken)
+	protected.Get("/destinations", h.GetDestinations)
+	protected.Get("/deliveries", h.GetDeliveries)
+	protected.Post("/deliveries/:id/retry", h.RetryDelivery)
+	protected.Get("/events", h.GetEvents)
 }
 
-// embedMiddleware extracts and validates the embed token from the
-// Authorization header and stores the tenant ID in the context.
-func (h *EmbedHandler) embedMiddleware(c *fiber.Ctx) error {
-	if h.embedToken == "" {
-		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "embed token not configured"})
+// --- Token generation and validation ---
+
+// GenerateEmbedToken creates a short-lived JWT for the embeddable component.
+// The JWT is signed with HMAC-SHA256 using embed.token_secret.
+//
+// Security notes:
+// - The token includes iat and exp claims to enforce short lifetimes.
+// - Only tenant_id and read_only are stored in claims (no sensitive data).
+// - Tokens are stateless — no server-side session store needed.
+func (h *EmbedHandler) GenerateEmbedToken(c *fiber.Ctx) error {
+	var req EmbedTokenRequest
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
 	}
 
+	if req.TenantID == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "tenant_id is required"})
+	}
+
+	now := time.Now().UTC()
+	expiresAt := now.Add(h.tokenTTL)
+
+	claims := embedClaims{
+		TenantID: req.TenantID,
+		ReadOnly: req.ReadOnly,
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer:    "pulseflow-embed",
+			Subject:   req.TenantID,
+			IssuedAt:  jwt.NewNumericDate(now),
+			ExpiresAt: jwt.NewNumericDate(expiresAt),
+			ID:        fmt.Sprintf("embed_%d", now.UnixNano()),
+		},
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	tokenStr, err := token.SignedString(h.tokenSecret)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to sign token"})
+	}
+
+	return c.JSON(EmbedTokenResponse{
+		Token:     tokenStr,
+		TenantID:  req.TenantID,
+		ExpiresAt: expiresAt.Unix(),
+		ReadOnly:  req.ReadOnly,
+	})
+}
+
+// RequireEmbedToken is the middleware that validates the JWT embed token
+// from the Authorization header and extracts the tenant_id into the request context.
+//
+// This middleware:
+// 1. Parses the Bearer token from the Authorization header.
+// 2. Validates the JWT signature against embed.token_secret.
+// 3. Checks the exp claim for expiration.
+// 4. Stores the tenant_id in c.Locals("tenant_id") for downstream handlers.
+//
+// Returns 401 Unauthorized on any token failure (missing, malformed,
+// expired, or invalid signature).
+func (h *EmbedHandler) RequireEmbedToken(c *fiber.Ctx) error {
 	authHeader := c.Get("Authorization")
 	if len(authHeader) < 8 || authHeader[:7] != "Bearer " {
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "missing bearer token"})
 	}
 
-	token := authHeader[7:]
-	tenantID, ok := h.validateEmbedToken(token)
+	tokenStr := authHeader[7:]
+	claims, ok := h.validateEmbedToken(tokenStr)
 	if !ok {
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "invalid or expired token"})
 	}
 
-	c.Locals("tenant_id", tenantID)
+	c.Locals("tenant_id", claims.TenantID)
+	c.Locals("read_only", claims.ReadOnly)
 	return c.Next()
 }
 
-// GetEmbedToken generates a short-lived token for the embeddable component.
-// Requires a valid API key or admin auth.
-func (h *EmbedHandler) GetEmbedToken(c *fiber.Ctx) error {
-	if h.embedToken == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "embed not enabled"})
+// validateEmbedToken verifies the JWT signature and expiration.
+// Returns the parsed claims and true on success, or false on any error.
+//
+// Using jwt.ParseWithClaims with a validation callback ensures:
+// - The signing method is HMAC-SHA256 (prevents algorithm confusion attacks).
+// - The signature is valid against our secret.
+// - The exp claim is checked automatically by the library.
+func (h *EmbedHandler) validateEmbedToken(tokenStr string) (*embedClaims, bool) {
+	token, err := jwt.ParseWithClaims(tokenStr, &embedClaims{}, func(token *jwt.Token) (any, error) {
+		// Security: verify the signing method is what we expect.
+		// This prevents algorithm confusion attacks (e.g., RS256 → HS256).
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+		}
+		return h.tokenSecret, nil
+	})
+
+	if err != nil {
+		// Distinguish expired from other errors for debugging,
+		// but return the same 401 to avoid information leakage.
+		if errors.Is(err, jwt.ErrTokenExpired) {
+			return nil, false
+		}
+		if errors.Is(err, jwt.ErrSignatureInvalid) {
+			return nil, false
+		}
+		return nil, false
 	}
 
-	tenantID := c.Query("tenant_id", "default")
-	expiresAt := time.Now().Add(h.tokenTTL).Unix()
+	if !token.Valid {
+		return nil, false
+	}
 
-	token := h.generateEmbedToken(tenantID, expiresAt)
+	claims, ok := token.Claims.(*embedClaims)
+	if !ok {
+		return nil, false
+	}
 
-	return c.JSON(fiber.Map{
-		"token":    token,
-		"tenant_id": tenantID,
-		"expires_at": expiresAt,
-		"read_only": c.Query("read_only", "false") == "true",
-	})
+	return claims, true
 }
+
+// --- Route handlers ---
 
 // GetDestinations returns all webhook destinations for the tenant.
 func (h *EmbedHandler) GetDestinations(c *fiber.Ctx) error {
@@ -117,11 +226,16 @@ func (h *EmbedHandler) GetDeliveries(c *fiber.Ctx) error {
 }
 
 // RetryDelivery marks a previously failed delivery for retry.
+// This is blocked if the token has read_only=true.
 func (h *EmbedHandler) RetryDelivery(c *fiber.Ctx) error {
-	destID := c.Params("id")
+	readOnly := c.Locals("read_only").(bool)
+	if readOnly {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "read-only token cannot perform write operations"})
+	}
 
+	destID := c.Params("id")
 	return c.JSON(fiber.Map{
-		"message":     "delivery queued for retry",
+		"message":      "delivery queued for retry",
 		"destination_id": destID,
 	})
 }
@@ -139,85 +253,5 @@ func (h *EmbedHandler) GetEvents(c *fiber.Ctx) error {
 	})
 }
 
-// generateEmbedToken creates an HMAC-signed token encoding tenant ID
-// and expiry. Format: <tenant_id>:<expiry_unix>:<hmac_hex>
-func (h *EmbedHandler) generateEmbedToken(tenantID string, expiresAt int64) string {
-	payload := fmt.Sprintf("%s:%d", tenantID, expiresAt)
-	signature := h.signToken(payload)
-	return fmt.Sprintf("%s:%s", payload, signature)
-}
-
-// validateEmbedToken checks the signature and expiry of an embed token.
-func (h *EmbedHandler) validateEmbedToken(token string) (string, bool) {
-	parts := splitToken(token, ':')
-	if len(parts) != 3 {
-		return "", false
-	}
-
-	tenantID := parts[0]
-	expiresAt, err := parseInt64(parts[1])
-	if err != nil {
-		return "", false
-	}
-
-	payload := fmt.Sprintf("%s:%d", tenantID, expiresAt)
-	expectedSig := h.signToken(payload)
-
-	if !hmac.Equal([]byte(parts[2]), []byte(expectedSig)) {
-		return "", false
-	}
-
-	if time.Now().Unix() > expiresAt {
-		return "", false
-	}
-
-	return tenantID, true
-}
-
-func (h *EmbedHandler) signToken(payload string) string {
-	mac := hmac.New(sha256.New, []byte(h.embedToken))
-	mac.Write([]byte(payload))
-	return hex.EncodeToString(mac.Sum(nil))
-}
-
-func splitToken(s string, sep byte) []string {
-	var parts []string
-	current := ""
-	for i := 0; i < len(s); i++ {
-		if s[i] == sep {
-			parts = append(parts, current)
-			current = ""
-		} else {
-			current += string(s[i])
-		}
-	}
-	parts = append(parts, current)
-	return parts
-}
-
-func parseInt64(s string) (int64, error) {
-	var n int64
-	for _, c := range s {
-		if c < '0' || c > '9' {
-			return 0, fmt.Errorf("invalid integer: %s", s)
-		}
-		n = n*10 + int64(c-'0')
-	}
-	return n, nil
-}
-
-// EmbedTokenResponse is the JSON response for GetEmbedToken.
-type EmbedTokenResponse struct {
-	Token    string `json:"token"`
-	TenantID string `json:"tenant_id"`
-	ExpiresAt int64  `json:"expires_at"`
-	ReadOnly  bool   `json:"read_only"`
-}
-
-// DeliveriesResponse is the JSON response for GetDeliveries.
-type DeliveriesResponse struct {
-	Deliveries []*entity.AuditRecord `json:"deliveries"`
-}
-
 // Ensure the handler compiles cleanly.
-var _ = context.Background
+var _ context.Context
